@@ -1,0 +1,11 @@
+{
+  "ZHWL-6T3-7ZN1": {
+    "active": true,
+    "hwid": null,
+    "bots": {
+      "BOT_A": {
+        "expiresAt": "2026-01-05T20:06:51.176Z"
+      }
+    }
+  }
+}
