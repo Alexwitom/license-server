@@ -10,28 +10,24 @@ app.use(express.json());
 
 /* ================= FILE ================= */
 const LICENSE_FILE = path.join(__dirname, "licenses.json");
-if (!fs.existsSync(LICENSE_FILE)) {
-  fs.writeFileSync(LICENSE_FILE, "{}");
-}
+if (!fs.existsSync(LICENSE_FILE)) fs.writeFileSync(LICENSE_FILE, "{}");
 
 /* ================= UTILS ================= */
 function getHWID(seed) {
   return crypto.createHash("sha256").update(seed).digest("hex");
 }
-
 function readLicenses() {
   return JSON.parse(fs.readFileSync(LICENSE_FILE, "utf8"));
 }
-
 function saveLicenses(data) {
   fs.writeFileSync(LICENSE_FILE, JSON.stringify(data, null, 2));
 }
 
 /* ================= LICENSE CHECK ================= */
 app.post("/license/check", (req, res) => {
-  const { key, botId, hwidSeed } = req.body;
+  const { key, botId, hwid } = req.body; // ⬅️ FIX
 
-  if (!key || !botId || !hwidSeed) {
+  if (!key || !botId || !hwid) {
     return res.json({ ok: false, reason: "BAD_REQUEST" });
   }
 
@@ -47,20 +43,16 @@ app.post("/license/check", (req, res) => {
     return res.json({ ok: false, reason: "EXPIRED" });
   }
 
-  const hwid = getHWID(hwidSeed);
+  const hwidHash = getHWID(hwid);
 
   if (!lic.hwid) {
-    lic.hwid = hwid;
+    lic.hwid = hwidHash;
     saveLicenses(licenses);
-  } else if (lic.hwid !== hwid) {
+  } else if (lic.hwid !== hwidHash) {
     return res.json({ ok: false, reason: "HWID_MISMATCH" });
   }
 
-  return res.json({
-    ok: true,
-    expiresAt,
-    expiresAtHuman: new Date(expiresAt).toLocaleString("pl-PL")
-  });
+  return res.json({ ok: true, expiresAt });
 });
 
 /* ================= ADMIN GENERATOR ================= */
@@ -68,44 +60,28 @@ app.post("/admin/generate", (req, res) => {
   const { botId, days, adminKey } = req.body;
 
   if (adminKey !== process.env.ADMIN_KEY) {
-    return res.status(403).json({ ok: false, reason: "UNAUTHORIZED" });
-  }
-
-  if (!botId || !days) {
-    return res.status(400).json({ ok: false, reason: "BAD_REQUEST" });
+    return res.status(403).json({ ok: false, reason: "FORBIDDEN" });
   }
 
   const licenses = readLicenses();
 
-  // 13 znaków: XXXX-XXX-XXXX
-  const raw = crypto.randomBytes(7).toString("hex").toUpperCase();
-  const key = `${raw.slice(0,4)}-${raw.slice(4,7)}-${raw.slice(7,11)}`;
-
+  const key = crypto.randomBytes(6).toString("hex").toUpperCase();
   const expiresAt = new Date(Date.now() + days * 86400000).toISOString();
 
   licenses[key] = {
     active: true,
     hwid: null,
-    bots: {
-      [botId]: {
-        expiresAt
-      }
-    }
+    bots: { [botId]: { expiresAt } }
   };
 
   saveLicenses(licenses);
 
-  res.json({
-    ok: true,
-    key,
-    botId,
-    expiresAt,
-    expiresAtHuman: new Date(expiresAt).toLocaleString("pl-PL")
-  });
+  res.json({ ok: true, key, expiresAt });
 });
 
 /* ================= START ================= */
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log("LICENSE SERVER RUNNING ON PORT", PORT);
-});
+app.listen(PORT, () =>
+  console.log("LICENSE SERVER RUNNING:", PORT)
+);
+
