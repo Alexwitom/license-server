@@ -13,8 +13,14 @@ function saveLicenses(data) {
   fs.writeFileSync(LICENSE_FILE, JSON.stringify(data, null, 2));
 }
 
+/* ================= KEY FORMAT ================= */
+// XXXX-XXX-XXXX (13 znaków)
 function generateKey() {
-  return crypto.randomBytes(6).toString("hex").toUpperCase();
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  const pick = (len) =>
+    Array.from({ length: len }, () => chars[Math.floor(Math.random() * chars.length)]).join("");
+
+  return `${pick(4)}-${pick(3)}-${pick(4)}`;
 }
 
 module.exports = (app) => {
@@ -26,15 +32,21 @@ module.exports = (app) => {
       return res.status(403).json({ ok: false, reason: "FORBIDDEN" });
     }
 
+    if (!botId || !days) {
+      return res.status(400).json({ ok: false, reason: "BAD_REQUEST" });
+    }
+
     const licenses = loadLicenses();
     const key = generateKey();
+
+    const expiresAt = new Date(Date.now() + days * 86400000);
 
     licenses[key] = {
       active: true,
       hwid: null,
       bots: {
         [botId]: {
-          expiresAt: new Date(Date.now() + days * 86400000).toISOString()
+          expiresAt: expiresAt.toISOString()
         }
       }
     };
@@ -44,7 +56,15 @@ module.exports = (app) => {
     res.json({
       ok: true,
       key,
-      expiresInDays: days
+      botId,
+      expiresAt: expiresAt.toISOString(),
+      expiresAtHuman: expiresAt.toLocaleString("pl-PL", {
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit"
+      })
     });
   });
 };
