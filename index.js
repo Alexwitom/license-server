@@ -7,7 +7,6 @@ const app = express();
 app.use(express.json());
 
 /* ================= FILE ================= */
-
 const LICENSE_FILE = path.join(__dirname, "licenses.json");
 
 if (!fs.existsSync(LICENSE_FILE)) {
@@ -15,7 +14,6 @@ if (!fs.existsSync(LICENSE_FILE)) {
 }
 
 /* ================= UTILS ================= */
-
 function readLicenses() {
   return JSON.parse(fs.readFileSync(LICENSE_FILE, "utf8"));
 }
@@ -24,12 +22,12 @@ function saveLicenses(data) {
   fs.writeFileSync(LICENSE_FILE, JSON.stringify(data, null, 2));
 }
 
+/* FORMAT: XXXX-XXX-XXXX */
 function generateKey() {
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
   const pick = (len) =>
     Array.from({ length: len }, () => chars[Math.floor(Math.random() * chars.length)]).join("");
 
-  // FORMAT: XXXX-XXX-XXXX
   return `${pick(4)}-${pick(3)}-${pick(4)}`;
 }
 
@@ -48,7 +46,6 @@ function hwidFromSeed(seed) {
 }
 
 /* ================= LICENSE CHECK ================= */
-
 app.post("/license/check", (req, res) => {
   const { key, botId, hwidSeed } = req.body;
 
@@ -85,7 +82,6 @@ app.post("/license/check", (req, res) => {
 });
 
 /* ================= ADMIN GENERATE ================= */
-
 app.post("/admin/generate", (req, res) => {
   const { botId, days, adminKey } = req.body;
 
@@ -113,7 +109,7 @@ app.post("/admin/generate", (req, res) => {
 
   saveLicenses(licenses);
 
-  res.json({
+  return res.json({
     ok: true,
     key,
     botId,
@@ -123,7 +119,6 @@ app.post("/admin/generate", (req, res) => {
 });
 
 /* ================= START ================= */
-
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log("LICENSE SERVER RUNNING ON PORT", PORT);
