@@ -9,7 +9,6 @@ app.use(express.json());
 /* ================= FILE ================= */
 
 const LICENSE_FILE = path.join(__dirname, "licenses.json");
-
 if (!fs.existsSync(LICENSE_FILE)) {
   fs.writeFileSync(LICENSE_FILE, "{}");
 }
@@ -30,6 +29,16 @@ function readLicenses() {
 
 function saveLicenses(data) {
   fs.writeFileSync(LICENSE_FILE, JSON.stringify(data, null, 2));
+}
+
+/* ================= ADMIN AUTH ================= */
+
+function adminAuth(req, res, next) {
+  const token = req.headers["x-admin-key"];
+  if (!token || token !== process.env.ADMIN_SECRET) {
+    return res.status(401).json({ ok: false, reason: "UNAUTHORIZED" });
+  }
+  next();
 }
 
 /* ================= LICENSE CHECK ================= */
@@ -66,7 +75,7 @@ app.post("/license/check", (req, res) => {
 
 /* ================= LICENSE GENERATOR (ADMIN) ================= */
 
-app.post("/license/generate", (req, res) => {
+app.post("/license/generate", adminAuth, (req, res) => {
   const { botId, expiresInDays } = req.body;
 
   if (!botId) {
@@ -102,7 +111,6 @@ app.post("/license/generate", (req, res) => {
 /* ================= START ================= */
 
 const PORT = process.env.PORT || 3000;
-
 app.listen(PORT, () => {
   console.log("LICENSE SERVER RUNNING ON PORT", PORT);
 });
