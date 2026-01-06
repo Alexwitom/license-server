@@ -1,3 +1,6 @@
+require("./routes/generate")(app);
+require("./routes/check")(app);
+
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
@@ -114,3 +117,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("LICENSE SERVER RUNNING ON PORT", PORT);
 });
+
