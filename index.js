@@ -1,29 +1,33 @@
-require("./routes/generate")(app);
-require("./routes/check")(app);
-
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
 const app = express();
+
+/* ================= MIDDLEWARE ================= */
 app.use(express.json());
 
 /* ================= FILE ================= */
-
 const LICENSE_FILE = path.join(__dirname, "licenses.json");
 if (!fs.existsSync(LICENSE_FILE)) {
   fs.writeFileSync(LICENSE_FILE, "{}");
 }
 
 /* ================= UTILS ================= */
-
 function getHWID(seed) {
   return crypto.createHash("sha256").update(seed).digest("hex");
 }
 
 function generateKey() {
-  return crypto.randomBytes(8).toString("hex").toUpperCase();
+  // 13 znaków: XXXX-XXXX-XXXX
+  return crypto
+    .randomBytes(6)
+    .toString("hex")
+    .toUpperCase()
+    .match(/.{1,4}/g)
+    .slice(0, 3)
+    .join("-");
 }
 
 function readLicenses() {
@@ -34,18 +38,19 @@ function saveLicenses(data) {
   fs.writeFileSync(LICENSE_FILE, JSON.stringify(data, null, 2));
 }
 
-/* ================= ADMIN AUTH ================= */
-
-function adminAuth(req, res, next) {
-  const token = req.headers["x-admin-key"];
-  if (!token || token !== process.env.ADMIN_SECRET) {
-    return res.status(401).json({ ok: false, reason: "UNAUTHORIZED" });
-  }
-  next();
-}
+/* ================= ROOT (ŻEBY NIE BYŁO Cannot POST /) ================= */
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    service: "LICENSE SERVER",
+    endpoints: [
+      "POST /license/check",
+      "POST /admin/generate"
+    ]
+  });
+});
 
 /* ================= LICENSE CHECK ================= */
-
 app.post("/license/check", (req, res) => {
   const { key, botId, hwidSeed } = req.body;
 
@@ -58,9 +63,11 @@ app.post("/license/check", (req, res) => {
 
   if (!lic) return res.json({ ok: false, reason: "INVALID_KEY" });
   if (!lic.active) return res.json({ ok: false, reason: "DISABLED" });
-  if (lic.botId !== botId) return res.json({ ok: false, reason: "WRONG_BOT" });
 
-  if (lic.expiresAt && Date.now() > lic.expiresAt) {
+  const bot = lic.bots?.[botId];
+  if (!bot) return res.json({ ok: false, reason: "WRONG_BOT" });
+
+  if (bot.expiresAt && Date.now() > new Date(bot.expiresAt).getTime()) {
     return res.json({ ok: false, reason: "EXPIRED" });
   }
 
@@ -73,48 +80,51 @@ app.post("/license/check", (req, res) => {
     return res.json({ ok: false, reason: "HWID_MISMATCH" });
   }
 
-  return res.json({ ok: true, license: lic });
+  return res.json({
+    ok: true,
+    expiresAt: bot.expiresAt
+  });
 });
 
 /* ================= LICENSE GENERATOR (ADMIN) ================= */
+app.post("/admin/generate", (req, res) => {
+  const { botId, days, adminKey } = req.body;
 
-app.post("/license/generate", adminAuth, (req, res) => {
-  const { botId, expiresInDays } = req.body;
+  if (adminKey !== process.env.ADMIN_KEY) {
+    return res.status(403).json({ ok: false, reason: "UNAUTHORIZED" });
+  }
 
-  if (!botId) {
-    return res.status(400).json({ ok: false, reason: "BOT_ID_REQUIRED" });
+  if (!botId || !days) {
+    return res.json({ ok: false, reason: "BAD_REQUEST" });
   }
 
   const licenses = readLicenses();
   const key = generateKey();
 
-  const expiresAt = expiresInDays
-    ? Date.now() + expiresInDays * 24 * 60 * 60 * 1000
-    : null;
-
   licenses[key] = {
-    key,
-    botId,
     active: true,
-    createdAt: Date.now(),
-    expiresAt,
-    hwid: null
+    hwid: null,
+    bots: {
+      [botId]: {
+        expiresAt: new Date(
+          Date.now() + days * 86400000
+        ).toISOString()
+      }
+    }
   };
 
   saveLicenses(licenses);
 
-  return res.json({
+  res.json({
     ok: true,
     key,
-    botId,
-    expiresAt
+    expiresAt: licenses[key].bots[botId].expiresAt
   });
 });
 
-/* ================= START ================= */
+/* ================= START (ZAWSZE NA KOŃCU) ================= */
+const PORT = process.env.PORT || 10000;
 
-const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("LICENSE SERVER RUNNING ON PORT", PORT);
 });
-
