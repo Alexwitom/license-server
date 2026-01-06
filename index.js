@@ -20,6 +20,8 @@ function readLicenses() {
 
 function saveLicenses(data) {
   fs.writeFileSync(LICENSE_FILE, JSON.stringify(data, null, 2));
+  console.log("SAVING LICENSES:", licenses);
+console.log("LICENSE FILE PATH:", LICENSE_FILE);
 }
 
 // FORMAT: XXXX-XXX-XXXX
@@ -122,3 +124,4 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log("LICENSE SERVER RUNNING ON PORT", PORT);
 });
+
