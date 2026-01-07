@@ -5,27 +5,22 @@ const crypto = require("crypto");
 const app = express();
 app.use(express.json());
 
-/* ================= DB ================= */
+/* ================= MONGO ================= */
 
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log("✅ MongoDB connected"))
   .catch(err => {
-    console.error("❌ MongoDB error", err);
+    console.error("❌ Mongo error:", err);
     process.exit(1);
   });
 
-/* ================= MODEL ================= */
+/* ================= SCHEMA ================= */
 
 const LicenseSchema = new mongoose.Schema({
-  key: { type: String, unique: true },
+  key: String,
   active: Boolean,
   hwid: String,
-  bots: {
-    type: Map,
-    of: {
-      expiresAt: Date
-    }
-  }
+  bots: Object
 });
 
 const License = mongoose.model("License", LicenseSchema);
@@ -39,21 +34,11 @@ function generateKey() {
   return `${pick(4)}-${pick(3)}-${pick(4)}`;
 }
 
-function formatDate(date) {
-  return date.toLocaleString("pl-PL", {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit"
-  });
-}
-
 function hwidFromSeed(seed) {
   return crypto.createHash("sha256").update(seed).digest("hex");
 }
 
-/* ================= LICENSE CHECK ================= */
+/* ================= CHECK ================= */
 
 app.post("/license/check", async (req, res) => {
   const { key, botId, hwidSeed } = req.body;
@@ -64,16 +49,14 @@ app.post("/license/check", async (req, res) => {
   const lic = await License.findOne({ key });
   if (!lic) return res.json({ ok: false, reason: "INVALID_KEY" });
   if (!lic.active) return res.json({ ok: false, reason: "DISABLED" });
+  if (!lic.bots?.[botId]) return res.json({ ok: false, reason: "WRONG_BOT" });
 
-  const bot = lic.bots.get(botId);
-  if (!bot) return res.json({ ok: false, reason: "WRONG_BOT" });
-
-  if (Date.now() > bot.expiresAt.getTime()) {
+  const expiresAt = new Date(lic.bots[botId].expiresAt);
+  if (Date.now() > expiresAt.getTime()) {
     return res.json({ ok: false, reason: "EXPIRED" });
   }
 
   const hwid = hwidFromSeed(hwidSeed);
-
   if (!lic.hwid) {
     lic.hwid = hwid;
     await lic.save();
@@ -83,22 +66,18 @@ app.post("/license/check", async (req, res) => {
 
   res.json({
     ok: true,
-    expiresAt: bot.expiresAt.toISOString(),
-    expiresAtHuman: formatDate(bot.expiresAt)
+    expiresAt: expiresAt.toISOString(),
+    expiresAtHuman: expiresAt.toLocaleString("pl-PL")
   });
 });
 
-/* ================= ADMIN GENERATE ================= */
+/* ================= GENERATE ================= */
 
 app.post("/admin/generate", async (req, res) => {
   const { botId, days, adminKey } = req.body;
 
   if (adminKey !== process.env.ADMIN_KEY) {
     return res.status(403).json({ ok: false, reason: "FORBIDDEN" });
-  }
-
-  if (!botId || !days) {
-    return res.status(400).json({ ok: false, reason: "BAD_REQUEST" });
   }
 
   const key = generateKey();
@@ -116,9 +95,8 @@ app.post("/admin/generate", async (req, res) => {
   res.json({
     ok: true,
     key,
-    botId,
     expiresAt: expiresAt.toISOString(),
-    expiresAtHuman: formatDate(expiresAt)
+    expiresAtHuman: expiresAt.toLocaleString("pl-PL")
   });
 });
 
