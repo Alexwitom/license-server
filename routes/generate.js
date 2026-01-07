@@ -1,3 +1,4 @@
+const License = require("../models/License");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
@@ -25,7 +26,7 @@ function generateKey() {
 }
 
 module.exports = (app) => {
-  app.post("/admin/generate", (req, res) => {
+  app.post("/admin/generate", async (req, res) => {
     const { botId, days, adminKey } = req.body;
 
     // 🔒 AUTORYZACJA
@@ -37,10 +38,33 @@ module.exports = (app) => {
       return res.status(400).json({ ok: false, reason: "BAD_REQUEST" });
     }
 
-    const licenses = loadLicenses();
     const key = generateKey();
-
     const expiresAt = new Date(Date.now() + Number(days) * 86400000);
+
+    /* ======================================================
+       🧠 MONGO – GŁÓWNE ŹRÓDŁO PRAWDY
+    ====================================================== */
+    try {
+      await License.create({
+        key,
+        active: true,
+        hwid: null,
+        bots: {
+          [botId]: {
+            expiresAt
+          }
+        },
+        createdAt: new Date()
+      });
+    } catch (err) {
+      console.error("❌ MONGO SAVE ERROR:", err);
+      return res.status(500).json({ ok: false, reason: "DB_ERROR" });
+    }
+
+    /* ======================================================
+       📄 JSON FALLBACK (NIC NIE USUWAMY)
+    ====================================================== */
+    const licenses = loadLicenses();
 
     licenses[key] = {
       active: true,
@@ -53,6 +77,8 @@ module.exports = (app) => {
     };
 
     saveLicenses(licenses);
+
+    /* ====================================================== */
 
     return res.json({
       ok: true,
