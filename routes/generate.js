@@ -57,6 +57,7 @@ module.exports = (app) => {
     return res.json({
       ok: true,
       key,
+      botId,
       expiresAt: expiresAt.toISOString(),
       expiresAtHuman: expiresAt.toLocaleString("pl-PL", {
         year: "numeric",
