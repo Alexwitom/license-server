@@ -16,7 +16,6 @@ function saveLicenses(data) {
 }
 
 /* ================= KEY FORMAT ================= */
-// FORMAT: XXXX-XXX-XXXX
 function generateKey() {
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
   const pick = (len) =>
@@ -27,12 +26,8 @@ function generateKey() {
 module.exports = (app) => {
   app.post("/admin/generate", async (req, res) => {
     const { botId, days, adminKey } = req.body;
-    
-    console.log("ENV ADMIN_KEY =", process.env.ADMIN_KEY);
-    console.log("REQ adminKey =", adminKey);
-    console.log("EQUAL =", adminKey === process.env.ADMIN_KEY);
 
-    /* 🔒 AUTH */
+    // 🔒 AUTORYZACJA
     if (adminKey !== process.env.ADMIN_KEY) {
       return res.status(403).json({ ok: false, reason: "FORBIDDEN" });
     }
@@ -42,41 +37,34 @@ module.exports = (app) => {
     }
 
     const key = generateKey();
+
     let expiresAt;
 
-    /* 🧠 DAYS LOGIC */
+    // ✅ lifetime
     if (typeof days === "string" && days.toLowerCase() === "lifetime") {
       expiresAt = new Date();
       expiresAt.setFullYear(expiresAt.getFullYear() + 100);
     } else {
       const daysNumber = Number(days);
+
       if (!Number.isFinite(daysNumber) || daysNumber <= 0) {
         return res.status(400).json({
           ok: false,
           reason: "INVALID_DAYS"
         });
       }
+
       expiresAt = new Date(Date.now() + daysNumber * 86400000);
     }
 
-    /* ❗ FINAL SAFETY CHECK */
-    if (isNaN(expiresAt.getTime())) {
-      return res.status(500).json({
-        ok: false,
-        reason: "INVALID_EXPIRES_DATE"
-      });
-    }
-
-    /* ================= MONGO ================= */
+    // 🧠 MONGO
     try {
       await License.create({
         key,
         active: true,
         hwid: null,
         bots: {
-          [botId]: {
-            expiresAt
-          }
+          [botId]: { expiresAt }
         },
         createdAt: new Date()
       });
@@ -85,7 +73,7 @@ module.exports = (app) => {
       return res.status(500).json({ ok: false, reason: "DB_ERROR" });
     }
 
-    /* ================= JSON FALLBACK ================= */
+    // 📄 JSON FALLBACK
     const licenses = loadLicenses();
     licenses[key] = {
       active: true,
@@ -98,7 +86,6 @@ module.exports = (app) => {
     };
     saveLicenses(licenses);
 
-    /* ================= RESPONSE ================= */
     return res.json({
       ok: true,
       key,
@@ -108,4 +95,3 @@ module.exports = (app) => {
     });
   });
 };
-
