@@ -28,7 +28,7 @@ module.exports = (app) => {
   app.post("/admin/generate", async (req, res) => {
     const { botId, days, adminKey } = req.body;
 
-    // 🔒 AUTORYZACJA
+    /* 🔒 AUTH */
     if (adminKey !== process.env.ADMIN_KEY) {
       return res.status(403).json({ ok: false, reason: "FORBIDDEN" });
     }
@@ -38,16 +38,15 @@ module.exports = (app) => {
     }
 
     const key = generateKey();
-
     let expiresAt;
 
-    // 🧠 LIFETIME
+    /* 🧠 DAYS LOGIC */
     if (typeof days === "string" && days.toLowerCase() === "lifetime") {
       expiresAt = new Date();
       expiresAt.setFullYear(expiresAt.getFullYear() + 100);
     } else {
       const daysNumber = Number(days);
-      if (isNaN(daysNumber) || daysNumber <= 0) {
+      if (!Number.isFinite(daysNumber) || daysNumber <= 0) {
         return res.status(400).json({
           ok: false,
           reason: "INVALID_DAYS"
@@ -56,7 +55,7 @@ module.exports = (app) => {
       expiresAt = new Date(Date.now() + daysNumber * 86400000);
     }
 
-    // 🛑 HARD CHECK (ważne)
+    /* ❗ FINAL SAFETY CHECK */
     if (isNaN(expiresAt.getTime())) {
       return res.status(500).json({
         ok: false,
@@ -95,6 +94,7 @@ module.exports = (app) => {
     };
     saveLicenses(licenses);
 
+    /* ================= RESPONSE ================= */
     return res.json({
       ok: true,
       key,
