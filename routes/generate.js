@@ -39,8 +39,24 @@ module.exports = (app) => {
     }
 
     const key = generateKey();
-    const expiresAt = new Date(Date.now() + Number(days) * 86400000);
+   let expiresAt;
 
+if (typeof days === "string" && days.toLowerCase() === "lifetime") {
+  // lifetime = 100 lat
+  expiresAt = new Date();
+  expiresAt.setFullYear(expiresAt.getFullYear() + 100);
+} else {
+  const daysNumber = Number(days);
+
+  if (isNaN(daysNumber) || daysNumber <= 0) {
+    return res.status(400).json({
+      ok: false,
+      reason: "INVALID_DAYS"
+    });
+  }
+
+  expiresAt = new Date(Date.now() + daysNumber * 86400000);
+}
     /* ======================================================
        🧠 MONGO – GŁÓWNE ŹRÓDŁO PRAWDY
     ====================================================== */
@@ -96,3 +112,4 @@ module.exports = (app) => {
     });
   });
 };
+
