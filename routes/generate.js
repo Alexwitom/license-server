@@ -1,4 +1,5 @@
 const License = require("../models/License");
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 
@@ -27,25 +28,25 @@ module.exports = (app) => {
   app.post("/admin/generate", async (req, res) => {
     const { botId, days, adminKey } = req.body;
 
-    /* 🔒 AUTH */
+    // 🔒 AUTORYZACJA
     if (adminKey !== process.env.ADMIN_KEY) {
       return res.status(403).json({ ok: false, reason: "FORBIDDEN" });
     }
 
-    if (!botId || days === undefined) {
+    // ✅ POPRAWNA WALIDACJA
+    if (!botId || days === undefined || days === null) {
       return res.status(400).json({ ok: false, reason: "BAD_REQUEST" });
     }
 
-    /* ================= EXPIRES ================= */
+    const key = generateKey();
+
     let expiresAt;
 
-    // 🔥 LIFETIME
+    // ♾️ LIFETIME
     if (typeof days === "string" && days.toLowerCase() === "lifetime") {
       expiresAt = new Date();
       expiresAt.setFullYear(expiresAt.getFullYear() + 100);
-    } 
-    // 🔢 NORMAL DAYS
-    else {
+    } else {
       const daysNumber = Number(days);
 
       if (!Number.isFinite(daysNumber) || daysNumber <= 0) {
@@ -57,16 +58,6 @@ module.exports = (app) => {
 
       expiresAt = new Date(Date.now() + daysNumber * 86400000);
     }
-
-    // 🛑 HARD GUARD (important)
-    if (!(expiresAt instanceof Date) || isNaN(expiresAt.getTime())) {
-      return res.status(500).json({
-        ok: false,
-        reason: "INVALID_EXPIRES_DATE"
-      });
-    }
-
-    const key = generateKey();
 
     /* ================= MONGO ================= */
     try {
@@ -82,12 +73,13 @@ module.exports = (app) => {
         createdAt: new Date()
       });
     } catch (err) {
-      console.error("❌ MONGO ERROR:", err);
+      console.error("❌ MONGO SAVE ERROR:", err);
       return res.status(500).json({ ok: false, reason: "DB_ERROR" });
     }
 
     /* ================= JSON FALLBACK ================= */
     const licenses = loadLicenses();
+
     licenses[key] = {
       active: true,
       hwid: null,
@@ -97,6 +89,7 @@ module.exports = (app) => {
         }
       }
     };
+
     saveLicenses(licenses);
 
     /* ================= RESPONSE ================= */
@@ -105,7 +98,14 @@ module.exports = (app) => {
       key,
       botId,
       expiresAt: expiresAt.toISOString(),
-      expiresAtHuman: expiresAt.toLocaleString("pl-PL"),
+      expiresAtHuman: expiresAt.toLocaleString("pl-PL", {
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit"
+      }),
       lifetime: typeof days === "string" && days.toLowerCase() === "lifetime"
     });
   });
