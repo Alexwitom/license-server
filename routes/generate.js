@@ -16,7 +16,7 @@ function saveLicenses(data) {
 }
 
 /* ================= KEY FORMAT ================= */
-// FORMAT: XXXX-XXX-XXXX
+// FORMAT: XXXX-XXX-XXXX (13 znaków)
 function generateKey() {
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
   const pick = (len) =>
@@ -33,39 +33,57 @@ module.exports = (app) => {
       return res.status(403).json({ ok: false, reason: "FORBIDDEN" });
     }
 
-    if (!botId || !days) {
+    if (!botId || days === undefined || days === null) {
       return res.status(400).json({ ok: false, reason: "BAD_REQUEST" });
     }
 
     const key = generateKey();
-
-    /* ================= EXPIRES ================= */
     let expiresAt;
 
-    if (typeof days === "string" && days.toLowerCase() === "lifetime") {
-      // lifetime = +100 lat
-      expiresAt = new Date();
-      expiresAt.setFullYear(expiresAt.getFullYear() + 100);
-    } else {
-      const daysNumber = Number(days);
-
-      if (isNaN(daysNumber) || daysNumber <= 0) {
+    /* ================= DAYS PARSER ================= */
+    if (typeof days === "string") {
+      if (days.toLowerCase() === "lifetime") {
+        // lifetime = 100 lat
+        expiresAt = new Date();
+        expiresAt.setFullYear(expiresAt.getFullYear() + 100);
+      } else {
         return res.status(400).json({
           ok: false,
-          reason: "INVALID_DAYS"
+          reason: "INVALID_DAYS_STRING"
         });
       }
-
+    } else {
+      const daysNumber = Number(days);
+      if (!Number.isFinite(daysNumber) || daysNumber <= 0) {
+        return res.status(400).json({
+          ok: false,
+          reason: "INVALID_DAYS_NUMBER"
+        });
+      }
       expiresAt = new Date(Date.now() + daysNumber * 86400000);
     }
 
-    /* ================= MONGO ================= */
+    // 🔐 OSTATECZNA WALIDACJA
+    if (isNaN(expiresAt.getTime())) {
+      return res.status(500).json({
+        ok: false,
+        reason: "INVALID_EXPIRES_AT"
+      });
+    }
+
+    /* ======================================================
+       🧠 MONGO – GŁÓWNE ŹRÓDŁO PRAWDY
+    ====================================================== */
     try {
       await License.create({
         key,
         active: true,
         hwid: null,
-        expiresAt,
+        bots: {
+          [botId]: {
+            expiresAt
+          }
+        },
         createdAt: new Date()
       });
     } catch (err) {
@@ -73,16 +91,22 @@ module.exports = (app) => {
       return res.status(500).json({ ok: false, reason: "DB_ERROR" });
     }
 
-    /* ================= JSON FALLBACK ================= */
+    /* ======================================================
+       📄 JSON FALLBACK (NIC NIE USUWAMY)
+    ====================================================== */
     const licenses = loadLicenses();
     licenses[key] = {
       active: true,
       hwid: null,
-      expiresAt: expiresAt.toISOString()
+      bots: {
+        [botId]: {
+          expiresAt: expiresAt.toISOString()
+        }
+      }
     };
     saveLicenses(licenses);
 
-    /* ================= RESPONSE ================= */
+    /* ====================================================== */
     return res.json({
       ok: true,
       key,
