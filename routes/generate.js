@@ -27,6 +27,10 @@ function generateKey() {
 module.exports = (app) => {
   app.post("/admin/generate", async (req, res) => {
     const { botId, days, adminKey } = req.body;
+    
+    console.log("ENV ADMIN_KEY =", process.env.ADMIN_KEY);
+    console.log("REQ adminKey =", adminKey);
+    console.log("EQUAL =", adminKey === process.env.ADMIN_KEY);
 
     /* 🔒 AUTH */
     if (adminKey !== process.env.ADMIN_KEY) {
@@ -104,3 +108,4 @@ module.exports = (app) => {
     });
   });
 };
+
