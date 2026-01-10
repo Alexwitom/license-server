@@ -33,23 +33,23 @@ module.exports = (app) => {
       return res.status(403).json({ ok: false, reason: "FORBIDDEN" });
     }
 
-    // ✅ POPRAWNA WALIDACJA
-    if (!botId || days === undefined || days === null) {
+    if (!botId || !days) {
       return res.status(400).json({ ok: false, reason: "BAD_REQUEST" });
     }
 
     const key = generateKey();
 
+    /* ================= EXPIRES ================= */
     let expiresAt;
 
-    // ♾️ LIFETIME
     if (typeof days === "string" && days.toLowerCase() === "lifetime") {
+      // lifetime = +100 lat
       expiresAt = new Date();
       expiresAt.setFullYear(expiresAt.getFullYear() + 100);
     } else {
       const daysNumber = Number(days);
 
-      if (!Number.isFinite(daysNumber) || daysNumber <= 0) {
+      if (isNaN(daysNumber) || daysNumber <= 0) {
         return res.status(400).json({
           ok: false,
           reason: "INVALID_DAYS"
@@ -65,11 +65,7 @@ module.exports = (app) => {
         key,
         active: true,
         hwid: null,
-        bots: {
-          [botId]: {
-            expiresAt
-          }
-        },
+        expiresAt,
         createdAt: new Date()
       });
     } catch (err) {
@@ -79,17 +75,11 @@ module.exports = (app) => {
 
     /* ================= JSON FALLBACK ================= */
     const licenses = loadLicenses();
-
     licenses[key] = {
       active: true,
       hwid: null,
-      bots: {
-        [botId]: {
-          expiresAt: expiresAt.toISOString()
-        }
-      }
+      expiresAt: expiresAt.toISOString()
     };
-
     saveLicenses(licenses);
 
     /* ================= RESPONSE ================= */
@@ -105,8 +95,7 @@ module.exports = (app) => {
         hour: "2-digit",
         minute: "2-digit",
         second: "2-digit"
-      }),
-      lifetime: typeof days === "string" && days.toLowerCase() === "lifetime"
+      })
     });
   });
 };
