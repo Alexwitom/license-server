@@ -39,6 +39,14 @@ module.exports = (app) => {
     const key = generateKey();
 
     let expiresAt;
+  // 🔥 HARD VALIDATION — MUSI TU BYĆ
+  if (!(expiresAt instanceof Date) || isNaN(expiresAt.getTime())) {
+  console.error("❌ INVALID expiresAt:", expiresAt, "days =", days);
+  return res.status(400).json({
+    ok: false,
+    reason: "INVALID_EXPIRES_DATE"
+    });
+  }
 
     // ✅ lifetime
     if (typeof days === "string" && days.toLowerCase() === "lifetime") {
@@ -95,3 +103,4 @@ module.exports = (app) => {
     });
   });
 };
+
