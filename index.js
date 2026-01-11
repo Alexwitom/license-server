@@ -540,6 +540,19 @@ app.post("/shopify/consume-order", async (req, res) => {
     });
   }
 
+  // TEMPORARY DEBUG: Log received orderId
+  console.log(`🔍 [DEBUG] Received orderId: "${orderId}"`);
+
+  // Normalize orderId: trim spaces and remove leading "#" if present
+  const originalOrderId = orderId;
+  let normalizedOrderId = String(orderId).trim();
+  if (normalizedOrderId.startsWith("#")) {
+    normalizedOrderId = normalizedOrderId.substring(1);
+  }
+  
+  // TEMPORARY DEBUG: Log normalized orderId
+  console.log(`🔍 [DEBUG] Normalized orderId: "${normalizedOrderId}"`);
+
   // Load Shopify store credentials from MongoDB
   let store;
   try {
@@ -560,162 +573,183 @@ app.post("/shopify/consume-order", async (req, res) => {
     });
   }
 
-  // Fetch specific order by orderId from Shopify API
-  const apiVersion = process.env.SHOPIFY_API_VERSION || "2024-01";
-  const apiPath = `/admin/api/${apiVersion}/orders/${orderId}.json`;
+  // Helper function to fetch order from Shopify API
+  const fetchOrderFromShopify = (identifier, isOrderNumber = false) => {
+    return new Promise((resolve, reject) => {
+      const apiVersion = process.env.SHOPIFY_API_VERSION || "2024-01";
+      // If searching by order_number, use query parameter; otherwise use path parameter
+      const apiPath = isOrderNumber
+        ? `/admin/api/${apiVersion}/orders.json?name=${encodeURIComponent(identifier)}`
+        : `/admin/api/${apiVersion}/orders/${identifier}.json`;
 
-  return new Promise((resolve) => {
-    const apiRequest = https.request(
-      {
-        hostname: store.shop,
-        path: apiPath,
-        method: "GET",
-        headers: {
-          "X-Shopify-Access-Token": store.accessToken,
-          "Content-Type": "application/json"
-        }
-      },
-      async (apiResponse) => {
-        let data = "";
-
-        apiResponse.on("data", (chunk) => {
-          data += chunk;
-        });
-
-        apiResponse.on("end", async () => {
-          // Handle non-200 responses from Shopify API
-          if (apiResponse.statusCode === 404) {
-            return res.status(404).json({
-              ok: false,
-              reason: "ORDER_NOT_FOUND",
-              message: "Order not found in Shopify store"
-            });
+      const apiRequest = https.request(
+        {
+          hostname: store.shop,
+          path: apiPath,
+          method: "GET",
+          headers: {
+            "X-Shopify-Access-Token": store.accessToken,
+            "Content-Type": "application/json"
           }
+        },
+        (apiResponse) => {
+          let data = "";
 
-          if (apiResponse.statusCode !== 200) {
-            console.error(`❌ Shopify API error (${apiResponse.statusCode}):`, data);
-            return res.status(500).json({
-              ok: false,
-              reason: "SHOPIFY_API_ERROR",
-              message: "Failed to fetch order from Shopify"
-            });
-          }
+          apiResponse.on("data", (chunk) => {
+            data += chunk;
+          });
 
-          try {
-            // Parse Shopify API response
-            const responseData = JSON.parse(data);
-            const order = responseData.order;
-
-            // Verify order exists
-            if (!order) {
-              return res.status(404).json({
-                ok: false,
-                reason: "ORDER_NOT_FOUND",
-                message: "Order not found in Shopify store"
-              });
-            }
-
-            // Verify order is paid
-            if (order.financial_status !== "paid") {
-              return res.status(400).json({
-                ok: false,
-                reason: "ORDER_NOT_PAID",
-                message: "Order is not paid"
-              });
-            }
-
-            // Verify order email matches provided email (case-insensitive)
-            const emailLower = email.toLowerCase().trim();
-            const orderEmail = (order.email || "").toLowerCase().trim();
-            
-            if (orderEmail !== emailLower) {
-              return res.status(400).json({
-                ok: false,
-                reason: "ORDER_EMAIL_MISMATCH",
-                message: "Order email does not match provided email"
-              });
-            }
-
-            const verifiedOrderId = String(order.id);
-
-            // TEMPORARY TESTING: Count existing consumptions instead of blocking on first use
-            // TODO: REVERT to single-use for production (check if exists and block if found)
-            let existingConsumptionCount;
-            try {
-              existingConsumptionCount = await ConsumedOrder.countDocuments({
-                clientId,
-                orderId: verifiedOrderId
-              });
-
-              // TEMPORARY: Allow multiple uses up to MAX_ORDER_USES limit
-              // PRODUCTION: Change this to block on first use (count >= 1)
-              if (existingConsumptionCount >= MAX_ORDER_USES) {
-                return res.status(409).json({
-                  ok: false,
-                  reason: "ORDER_USE_LIMIT_REACHED",
-                  message: `This order has reached the maximum use limit (${MAX_ORDER_USES})`
-                });
+          apiResponse.on("end", () => {
+            if (apiResponse.statusCode === 200) {
+              try {
+                const responseData = JSON.parse(data);
+                // When searching by order_number, response is { orders: [...] }
+                // When searching by ID, response is { order: {...} }
+                const order = isOrderNumber
+                  ? (responseData.orders && responseData.orders.length > 0 ? responseData.orders[0] : null)
+                  : responseData.order;
+                resolve(order);
+              } catch (parseError) {
+                reject(new Error(`Failed to parse response: ${parseError.message}`));
               }
-            } catch (checkError) {
-              console.error("❌ Database error checking consumed order count:", checkError);
-              return res.status(500).json({
-                ok: false,
-                reason: "DB_ERROR",
-                message: "Failed to check order consumption count"
-              });
+            } else if (apiResponse.statusCode === 404) {
+              resolve(null); // Order not found
+            } else {
+              reject(new Error(`API error ${apiResponse.statusCode}: ${data}`));
             }
+          });
+        }
+      );
 
-            // Store consumption record in MongoDB
-            // TEMPORARY: Allows multiple records for the same orderId
-            // PRODUCTION: Should only allow one record per orderId (enforced by unique index)
-            try {
-              await ConsumedOrder.create({
-                clientId,
-                orderId: verifiedOrderId,
-                email: emailLower,
-                discordUserId,
-                consumedAt: new Date()
-              });
+      apiRequest.on("error", (err) => {
+        reject(err);
+      });
 
-              // Return success with orderId
-              res.json({
-                ok: true,
-                orderId: verifiedOrderId
-              });
-            } catch (saveError) {
-              console.error("❌ Database error saving consumed order:", saveError);
-              return res.status(500).json({
-                ok: false,
-                reason: "DB_ERROR",
-                message: "Failed to save consumed order record"
-              });
-            }
-          } catch (parseError) {
-            console.error("❌ Failed to parse Shopify API response:", parseError);
-            return res.status(500).json({
-              ok: false,
-              reason: "PARSE_ERROR",
-              message: "Invalid response from Shopify API"
-            });
-          }
+      apiRequest.end();
+    });
+  };
 
-          resolve();
+  // Try to fetch order: first by ID, then by order_number if not found
+  let order = null;
+  try {
+    // First attempt: try as numeric ID
+    order = await fetchOrderFromShopify(normalizedOrderId, false);
+    
+    // If not found and normalizedOrderId looks like it could be an order number, try by order_number
+    if (!order && normalizedOrderId && !/^\d+$/.test(normalizedOrderId)) {
+      order = await fetchOrderFromShopify(normalizedOrderId, true);
+    } else if (!order) {
+      // If it's numeric and not found, also try as order_number
+      order = await fetchOrderFromShopify(normalizedOrderId, true);
+    }
+  } catch (fetchError) {
+    console.error("❌ Error fetching order from Shopify:", fetchError);
+    return res.status(500).json({
+      ok: false,
+      reason: "SHOPIFY_API_ERROR",
+      message: "Failed to fetch order from Shopify"
+    });
+  }
+
+  // Verify order exists
+  if (!order) {
+    return res.status(404).json({
+      ok: false,
+      reason: "ORDER_NOT_FOUND",
+      message: "Order not found in Shopify store"
+    });
+  }
+
+  // Extract the real Shopify order ID from the order object
+  const verifiedOrderId = String(order.id);
+  
+  // TEMPORARY DEBUG: Log resolved Shopify order ID
+  console.log(`🔍 [DEBUG] Resolved Shopify order ID: ${verifiedOrderId}`);
+
+  // Continue with order verification
+  try {
+
+    // Verify order is paid
+    if (order.financial_status !== "paid") {
+      return res.status(400).json({
+        ok: false,
+        reason: "ORDER_NOT_PAID",
+        message: "Order is not paid"
+      });
+    }
+
+    // Verify order email matches provided email (case-insensitive)
+    const emailLower = email.toLowerCase().trim();
+    const orderEmail = (order.email || "").toLowerCase().trim();
+    
+    if (orderEmail !== emailLower) {
+      return res.status(400).json({
+        ok: false,
+        reason: "ORDER_EMAIL_MISMATCH",
+        message: "Order email does not match provided email"
+      });
+    }
+
+    // TEMPORARY TESTING: Count existing consumptions instead of blocking on first use
+    // TODO: REVERT to single-use for production (check if exists and block if found)
+    let existingConsumptionCount;
+    try {
+      existingConsumptionCount = await ConsumedOrder.countDocuments({
+        clientId,
+        orderId: verifiedOrderId
+      });
+
+      // TEMPORARY: Allow multiple uses up to MAX_ORDER_USES limit
+      // PRODUCTION: Change this to block on first use (count >= 1)
+      if (existingConsumptionCount >= MAX_ORDER_USES) {
+        return res.status(409).json({
+          ok: false,
+          reason: "ORDER_USE_LIMIT_REACHED",
+          message: `This order has reached the maximum use limit (${MAX_ORDER_USES})`
         });
       }
-    );
-
-    apiRequest.on("error", (err) => {
-      console.error("❌ Request error during Shopify API call:", err);
-      res.status(500).json({
+    } catch (checkError) {
+      console.error("❌ Database error checking consumed order count:", checkError);
+      return res.status(500).json({
         ok: false,
-        reason: "REQUEST_ERROR",
-        message: "Failed to communicate with Shopify API"
+        reason: "DB_ERROR",
+        message: "Failed to check order consumption count"
       });
-      resolve();
-    });
+    }
 
-    apiRequest.end();
-  });
+    // Store consumption record in MongoDB
+    // TEMPORARY: Allows multiple records for the same orderId
+    // PRODUCTION: Should only allow one record per orderId (enforced by unique index)
+    try {
+      await ConsumedOrder.create({
+        clientId,
+        orderId: verifiedOrderId,
+        email: emailLower,
+        discordUserId,
+        consumedAt: new Date()
+      });
+
+      // Return success with orderId
+      res.json({
+        ok: true,
+        orderId: verifiedOrderId
+      });
+    } catch (saveError) {
+      console.error("❌ Database error saving consumed order:", saveError);
+      return res.status(500).json({
+        ok: false,
+        reason: "DB_ERROR",
+        message: "Failed to save consumed order record"
+      });
+    }
+  } catch (error) {
+    console.error("❌ Error processing order:", error);
+    return res.status(500).json({
+      ok: false,
+      reason: "PROCESSING_ERROR",
+      message: "Failed to process order verification"
+    });
+  }
 });
 
 /* ================= START ================= */
