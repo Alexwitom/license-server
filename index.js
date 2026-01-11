@@ -500,38 +500,43 @@ app.get("/shopify/verify-order", async (req, res) => {
  * 
  * Request body:
  *   - clientId: Client identifier (store owner's ID)
+ *   - orderId: Shopify order ID (explicit, required)
  *   - email: Customer email address
  *   - discordUserId: Discord user ID who is consuming the order
  * 
  * Usage in Discord Bot:
- *   - User claims they purchased from a Shopify store
+ *   - User provides their Shopify order ID
  *   - Bot calls this endpoint to mark the order as consumed
  *   - Bot grants Discord role based on successful consumption
- *   - Same order cannot be consumed twice (prevents abuse)
  * 
- * Abuse Protection:
- *   - Orders are single-use: once consumed, cannot be used again
- *   - Prevents users from claiming the same purchase multiple times
- *   - Prevents sharing order IDs to get unlimited role grants
- *   - Each purchase grants access exactly once, protecting store owner's business
+ * TEMPORARY TESTING MODE:
+ *   - Currently allows orders to be reused up to MAX_ORDER_USES times
+ *   - This is FOR TESTING ONLY and should be reverted to single-use for production
+ *   - Production should block reuse completely to prevent abuse
  * 
  * Flow:
- * 1. Validates required request body fields (clientId, email, discordUserId)
+ * 1. Validates required request body fields (clientId, orderId, email, discordUserId)
  * 2. Loads Shopify store credentials from MongoDB
- * 3. Verifies order exists and is paid (reuses verification logic)
- * 4. Checks if orderId has already been consumed
- * 5. If not consumed, stores record in ConsumedOrders collection
- * 6. Returns success with orderId
+ * 3. Fetches specific order by orderId from Shopify API
+ * 4. Verifies order exists, is paid, and email matches
+ * 5. Counts how many times this orderId has already been consumed
+ * 6. If count < MAX_ORDER_USES, stores new consumption record
+ * 7. Returns success with orderId
  */
-app.post("/shopify/consume-order", async (req, res) => {
-  const { clientId, email, discordUserId } = req.body;
 
-  // Validate required request body fields
-  if (!clientId || !email || !discordUserId) {
+// TEMPORARY TESTING CONSTANT - REMOVE FOR PRODUCTION
+// TODO: REVERT to single-use behavior for production (block on first use)
+const MAX_ORDER_USES = 3;
+
+app.post("/shopify/consume-order", async (req, res) => {
+  const { clientId, orderId, email, discordUserId } = req.body;
+
+  // Validate required request body fields (orderId is now explicitly required)
+  if (!clientId || !orderId || !email || !discordUserId) {
     return res.status(400).json({
       ok: false,
       reason: "BAD_REQUEST",
-      message: "clientId, email, and discordUserId are required in request body"
+      message: "clientId, orderId, email, and discordUserId are required in request body"
     });
   }
 
@@ -555,9 +560,9 @@ app.post("/shopify/consume-order", async (req, res) => {
     });
   }
 
-  // Verify order exists and is paid (reuse verification logic pattern)
+  // Fetch specific order by orderId from Shopify API
   const apiVersion = process.env.SHOPIFY_API_VERSION || "2024-01";
-  const apiPath = `/admin/api/${apiVersion}/orders.json?status=any&limit=250`;
+  const apiPath = `/admin/api/${apiVersion}/orders/${orderId}.json`;
 
   return new Promise((resolve) => {
     const apiRequest = https.request(
@@ -579,68 +584,94 @@ app.post("/shopify/consume-order", async (req, res) => {
 
         apiResponse.on("end", async () => {
           // Handle non-200 responses from Shopify API
+          if (apiResponse.statusCode === 404) {
+            return res.status(404).json({
+              ok: false,
+              reason: "ORDER_NOT_FOUND",
+              message: "Order not found in Shopify store"
+            });
+          }
+
           if (apiResponse.statusCode !== 200) {
             console.error(`❌ Shopify API error (${apiResponse.statusCode}):`, data);
             return res.status(500).json({
               ok: false,
               reason: "SHOPIFY_API_ERROR",
-              message: "Failed to fetch orders from Shopify"
+              message: "Failed to fetch order from Shopify"
             });
           }
 
           try {
             // Parse Shopify API response
             const responseData = JSON.parse(data);
-            const orders = responseData.orders || [];
+            const order = responseData.order;
 
-            // Filter orders by email (case-insensitive) and financial_status = "paid"
-            const emailLower = email.toLowerCase().trim();
-            const paidOrder = orders.find(order => {
-              const orderEmail = (order.email || "").toLowerCase().trim();
-              return orderEmail === emailLower && order.financial_status === "paid";
-            });
-
-            // Check if order exists and is paid
-            if (!paidOrder) {
+            // Verify order exists
+            if (!order) {
               return res.status(404).json({
                 ok: false,
                 reason: "ORDER_NOT_FOUND",
-                message: "No paid order found for this email"
+                message: "Order not found in Shopify store"
               });
             }
 
-            const orderId = String(paidOrder.id);
+            // Verify order is paid
+            if (order.financial_status !== "paid") {
+              return res.status(400).json({
+                ok: false,
+                reason: "ORDER_NOT_PAID",
+                message: "Order is not paid"
+              });
+            }
 
-            // Check if order has already been consumed
-            let existingConsumption;
+            // Verify order email matches provided email (case-insensitive)
+            const emailLower = email.toLowerCase().trim();
+            const orderEmail = (order.email || "").toLowerCase().trim();
+            
+            if (orderEmail !== emailLower) {
+              return res.status(400).json({
+                ok: false,
+                reason: "ORDER_EMAIL_MISMATCH",
+                message: "Order email does not match provided email"
+              });
+            }
+
+            const verifiedOrderId = String(order.id);
+
+            // TEMPORARY TESTING: Count existing consumptions instead of blocking on first use
+            // TODO: REVERT to single-use for production (check if exists and block if found)
+            let existingConsumptionCount;
             try {
-              existingConsumption = await ConsumedOrder.findOne({
+              existingConsumptionCount = await ConsumedOrder.countDocuments({
                 clientId,
-                orderId
+                orderId: verifiedOrderId
               });
 
-              if (existingConsumption) {
+              // TEMPORARY: Allow multiple uses up to MAX_ORDER_USES limit
+              // PRODUCTION: Change this to block on first use (count >= 1)
+              if (existingConsumptionCount >= MAX_ORDER_USES) {
                 return res.status(409).json({
                   ok: false,
-                  reason: "ORDER_ALREADY_CONSUMED",
-                  message: "This order has already been used",
-                  consumedAt: existingConsumption.consumedAt
+                  reason: "ORDER_USE_LIMIT_REACHED",
+                  message: `This order has reached the maximum use limit (${MAX_ORDER_USES})`
                 });
               }
             } catch (checkError) {
-              console.error("❌ Database error checking consumed order:", checkError);
+              console.error("❌ Database error checking consumed order count:", checkError);
               return res.status(500).json({
                 ok: false,
                 reason: "DB_ERROR",
-                message: "Failed to check if order was already consumed"
+                message: "Failed to check order consumption count"
               });
             }
 
             // Store consumption record in MongoDB
+            // TEMPORARY: Allows multiple records for the same orderId
+            // PRODUCTION: Should only allow one record per orderId (enforced by unique index)
             try {
               await ConsumedOrder.create({
                 clientId,
-                orderId,
+                orderId: verifiedOrderId,
                 email: emailLower,
                 discordUserId,
                 consumedAt: new Date()
@@ -649,18 +680,9 @@ app.post("/shopify/consume-order", async (req, res) => {
               // Return success with orderId
               res.json({
                 ok: true,
-                orderId
+                orderId: verifiedOrderId
               });
             } catch (saveError) {
-              // Handle unique constraint violation (race condition)
-              if (saveError.code === 11000) {
-                return res.status(409).json({
-                  ok: false,
-                  reason: "ORDER_ALREADY_CONSUMED",
-                  message: "This order has already been used"
-                });
-              }
-
               console.error("❌ Database error saving consumed order:", saveError);
               return res.status(500).json({
                 ok: false,
