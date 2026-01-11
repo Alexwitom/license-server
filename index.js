@@ -5,7 +5,28 @@ const https = require("https");
 const querystring = require("querystring");
 
 const app = express();
-app.use(express.json());
+
+// Configure JSON body parser with error handling to prevent crashes on malformed JSON
+app.use(express.json({
+  strict: true, // Only parse arrays and objects
+  limit: '10mb' // Prevent abuse
+}));
+
+// Error handler for JSON parsing errors
+// Catches SyntaxError thrown by express.json() when malformed JSON is sent
+app.use((err, req, res, next) => {
+  // Express JSON parser throws SyntaxError with status 400 when JSON is malformed
+  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+    console.error("❌ JSON parsing error:", err.message);
+    return res.status(400).json({
+      ok: false,
+      reason: "INVALID_JSON",
+      message: "Request body contains invalid JSON"
+    });
+  }
+  // Pass other errors to default error handler
+  next(err);
+});
 
 /* ================= MONGO ================= */
 
@@ -529,6 +550,30 @@ app.get("/shopify/verify-order", async (req, res) => {
 const MAX_ORDER_USES = 3;
 
 app.post("/shopify/consume-order", async (req, res) => {
+  // TEMPORARY DEBUG: Log content-type and raw body
+  const contentType = req.headers['content-type'] || '';
+  const rawBody = req.body ? JSON.stringify(req.body).substring(0, 200) : '(empty)';
+  console.log(`🔍 [DEBUG] Content-Type: "${contentType}"`);
+  console.log(`🔍 [DEBUG] Raw body (first 200 chars): ${rawBody}`);
+
+  // Defensive guard: Require Content-Type to be application/json
+  if (!contentType.includes('application/json')) {
+    return res.status(400).json({
+      ok: false,
+      reason: "INVALID_CONTENT_TYPE",
+      message: "Content-Type must be application/json"
+    });
+  }
+
+  // Defensive guard: Ensure body is an object (not null, undefined, or primitive)
+  if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+    return res.status(400).json({
+      ok: false,
+      reason: "INVALID_BODY",
+      message: "Request body must be a JSON object"
+    });
+  }
+
   const { clientId, orderId, email, discordUserId } = req.body;
 
   // Validate required request body fields (orderId is now explicitly required)
