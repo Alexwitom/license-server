@@ -30,6 +30,7 @@ const License = mongoose.model("License", LicenseSchema);
 /* ================= SHOPIFY MODEL ================= */
 
 const ShopifyStore = require("./models/ShopifyStore");
+const ConsumedOrder = require("./models/ConsumedOrder");
 
 /* ================= ENV VALIDATION ================= */
 
@@ -347,6 +348,351 @@ app.get("/shopify/callback", async (req, res) => {
 
     tokenRequest.write(tokenRequestData);
     tokenRequest.end();
+  });
+});
+
+/**
+ * GET /shopify/verify-order
+ * Verifies if a customer has a paid order in the client's Shopify store
+ * 
+ * Query params:
+ *   - clientId: Client identifier (e.g., Discord user ID)
+ *   - email: Customer email address to check
+ * 
+ * Usage in Discord Bot:
+ *   - User claims to have purchased from a Shopify store
+ *   - Bot calls this endpoint with user's Discord ID as clientId and their email
+ *   - Bot receives hasOrder flag to grant access or permissions
+ *   - Bot can display orderId for confirmation if needed
+ * 
+ * Flow:
+ * 1. Validates required query parameters (clientId, email)
+ * 2. Loads Shopify store credentials from MongoDB using clientId
+ * 3. Makes authenticated request to Shopify Admin API to fetch recent orders
+ * 4. Filters orders by email (case-insensitive) and financial_status = "paid"
+ * 5. Returns whether a paid order exists and the order ID if found
+ */
+app.get("/shopify/verify-order", async (req, res) => {
+  const { clientId, email } = req.query;
+
+  // Validate required query parameters
+  if (!clientId || !email) {
+    return res.status(400).json({
+      ok: false,
+      reason: "BAD_REQUEST",
+      message: "clientId and email query parameters are required"
+    });
+  }
+
+  // Load Shopify store credentials from MongoDB
+  let store;
+  try {
+    store = await ShopifyStore.findOne({ clientId });
+    if (!store) {
+      return res.status(404).json({
+        ok: false,
+        reason: "STORE_NOT_FOUND",
+        message: "No Shopify store connected for this client"
+      });
+    }
+  } catch (dbError) {
+    console.error("❌ Database error loading Shopify store:", dbError);
+    return res.status(500).json({
+      ok: false,
+      reason: "DB_ERROR",
+      message: "Failed to load Shopify store credentials"
+    });
+  }
+
+  // Update lastUsedAt timestamp
+  try {
+    store.lastUsedAt = new Date();
+    await store.save();
+  } catch (updateError) {
+    // Non-fatal: continue even if timestamp update fails
+    console.warn("⚠️  Failed to update lastUsedAt:", updateError);
+  }
+
+  // Prepare Shopify API request
+  // Use Shopify Admin REST API to fetch orders
+  // API version can be configured via env var, default to stable version
+  const apiVersion = process.env.SHOPIFY_API_VERSION || "2024-01";
+  const apiPath = `/admin/api/${apiVersion}/orders.json?status=any&limit=250`;
+
+  return new Promise((resolve) => {
+    const apiRequest = https.request(
+      {
+        hostname: store.shop,
+        path: apiPath,
+        method: "GET",
+        headers: {
+          "X-Shopify-Access-Token": store.accessToken,
+          "Content-Type": "application/json"
+        }
+      },
+      (apiResponse) => {
+        let data = "";
+
+        apiResponse.on("data", (chunk) => {
+          data += chunk;
+        });
+
+        apiResponse.on("end", () => {
+          // Handle non-200 responses from Shopify API
+          if (apiResponse.statusCode !== 200) {
+            console.error(`❌ Shopify API error (${apiResponse.statusCode}):`, data);
+            return res.status(500).json({
+              ok: false,
+              reason: "SHOPIFY_API_ERROR",
+              message: "Failed to fetch orders from Shopify"
+            });
+          }
+
+          try {
+            // Parse Shopify API response
+            const responseData = JSON.parse(data);
+            const orders = responseData.orders || [];
+
+            // Filter orders by email (case-insensitive) and financial_status = "paid"
+            const emailLower = email.toLowerCase().trim();
+            const paidOrder = orders.find(order => {
+              const orderEmail = (order.email || "").toLowerCase().trim();
+              return orderEmail === emailLower && order.financial_status === "paid";
+            });
+
+            // Return verification result
+            res.json({
+              ok: true,
+              hasOrder: paidOrder !== undefined,
+              orderId: paidOrder ? String(paidOrder.id) : null
+            });
+          } catch (parseError) {
+            console.error("❌ Failed to parse Shopify API response:", parseError);
+            res.status(500).json({
+              ok: false,
+              reason: "PARSE_ERROR",
+              message: "Invalid response from Shopify API"
+            });
+          }
+
+          resolve();
+        });
+      }
+    );
+
+    apiRequest.on("error", (err) => {
+      console.error("❌ Request error during Shopify API call:", err);
+      res.status(500).json({
+        ok: false,
+        reason: "REQUEST_ERROR",
+        message: "Failed to communicate with Shopify API"
+      });
+      resolve();
+    });
+
+    apiRequest.end();
+  });
+});
+
+/**
+ * POST /shopify/consume-order
+ * Marks a Shopify order as consumed (used) for Discord role access
+ * 
+ * Request body:
+ *   - clientId: Client identifier (store owner's ID)
+ *   - email: Customer email address
+ *   - discordUserId: Discord user ID who is consuming the order
+ * 
+ * Usage in Discord Bot:
+ *   - User claims they purchased from a Shopify store
+ *   - Bot calls this endpoint to mark the order as consumed
+ *   - Bot grants Discord role based on successful consumption
+ *   - Same order cannot be consumed twice (prevents abuse)
+ * 
+ * Abuse Protection:
+ *   - Orders are single-use: once consumed, cannot be used again
+ *   - Prevents users from claiming the same purchase multiple times
+ *   - Prevents sharing order IDs to get unlimited role grants
+ *   - Each purchase grants access exactly once, protecting store owner's business
+ * 
+ * Flow:
+ * 1. Validates required request body fields (clientId, email, discordUserId)
+ * 2. Loads Shopify store credentials from MongoDB
+ * 3. Verifies order exists and is paid (reuses verification logic)
+ * 4. Checks if orderId has already been consumed
+ * 5. If not consumed, stores record in ConsumedOrders collection
+ * 6. Returns success with orderId
+ */
+app.post("/shopify/consume-order", async (req, res) => {
+  const { clientId, email, discordUserId } = req.body;
+
+  // Validate required request body fields
+  if (!clientId || !email || !discordUserId) {
+    return res.status(400).json({
+      ok: false,
+      reason: "BAD_REQUEST",
+      message: "clientId, email, and discordUserId are required in request body"
+    });
+  }
+
+  // Load Shopify store credentials from MongoDB
+  let store;
+  try {
+    store = await ShopifyStore.findOne({ clientId });
+    if (!store) {
+      return res.status(404).json({
+        ok: false,
+        reason: "STORE_NOT_FOUND",
+        message: "No Shopify store connected for this client"
+      });
+    }
+  } catch (dbError) {
+    console.error("❌ Database error loading Shopify store:", dbError);
+    return res.status(500).json({
+      ok: false,
+      reason: "DB_ERROR",
+      message: "Failed to load Shopify store credentials"
+    });
+  }
+
+  // Verify order exists and is paid (reuse verification logic pattern)
+  const apiVersion = process.env.SHOPIFY_API_VERSION || "2024-01";
+  const apiPath = `/admin/api/${apiVersion}/orders.json?status=any&limit=250`;
+
+  return new Promise((resolve) => {
+    const apiRequest = https.request(
+      {
+        hostname: store.shop,
+        path: apiPath,
+        method: "GET",
+        headers: {
+          "X-Shopify-Access-Token": store.accessToken,
+          "Content-Type": "application/json"
+        }
+      },
+      async (apiResponse) => {
+        let data = "";
+
+        apiResponse.on("data", (chunk) => {
+          data += chunk;
+        });
+
+        apiResponse.on("end", async () => {
+          // Handle non-200 responses from Shopify API
+          if (apiResponse.statusCode !== 200) {
+            console.error(`❌ Shopify API error (${apiResponse.statusCode}):`, data);
+            return res.status(500).json({
+              ok: false,
+              reason: "SHOPIFY_API_ERROR",
+              message: "Failed to fetch orders from Shopify"
+            });
+          }
+
+          try {
+            // Parse Shopify API response
+            const responseData = JSON.parse(data);
+            const orders = responseData.orders || [];
+
+            // Filter orders by email (case-insensitive) and financial_status = "paid"
+            const emailLower = email.toLowerCase().trim();
+            const paidOrder = orders.find(order => {
+              const orderEmail = (order.email || "").toLowerCase().trim();
+              return orderEmail === emailLower && order.financial_status === "paid";
+            });
+
+            // Check if order exists and is paid
+            if (!paidOrder) {
+              return res.status(404).json({
+                ok: false,
+                reason: "ORDER_NOT_FOUND",
+                message: "No paid order found for this email"
+              });
+            }
+
+            const orderId = String(paidOrder.id);
+
+            // Check if order has already been consumed
+            let existingConsumption;
+            try {
+              existingConsumption = await ConsumedOrder.findOne({
+                clientId,
+                orderId
+              });
+
+              if (existingConsumption) {
+                return res.status(409).json({
+                  ok: false,
+                  reason: "ORDER_ALREADY_CONSUMED",
+                  message: "This order has already been used",
+                  consumedAt: existingConsumption.consumedAt
+                });
+              }
+            } catch (checkError) {
+              console.error("❌ Database error checking consumed order:", checkError);
+              return res.status(500).json({
+                ok: false,
+                reason: "DB_ERROR",
+                message: "Failed to check if order was already consumed"
+              });
+            }
+
+            // Store consumption record in MongoDB
+            try {
+              await ConsumedOrder.create({
+                clientId,
+                orderId,
+                email: emailLower,
+                discordUserId,
+                consumedAt: new Date()
+              });
+
+              // Return success with orderId
+              res.json({
+                ok: true,
+                orderId
+              });
+            } catch (saveError) {
+              // Handle unique constraint violation (race condition)
+              if (saveError.code === 11000) {
+                return res.status(409).json({
+                  ok: false,
+                  reason: "ORDER_ALREADY_CONSUMED",
+                  message: "This order has already been used"
+                });
+              }
+
+              console.error("❌ Database error saving consumed order:", saveError);
+              return res.status(500).json({
+                ok: false,
+                reason: "DB_ERROR",
+                message: "Failed to save consumed order record"
+              });
+            }
+          } catch (parseError) {
+            console.error("❌ Failed to parse Shopify API response:", parseError);
+            return res.status(500).json({
+              ok: false,
+              reason: "PARSE_ERROR",
+              message: "Invalid response from Shopify API"
+            });
+          }
+
+          resolve();
+        });
+      }
+    );
+
+    apiRequest.on("error", (err) => {
+      console.error("❌ Request error during Shopify API call:", err);
+      res.status(500).json({
+        ok: false,
+        reason: "REQUEST_ERROR",
+        message: "Failed to communicate with Shopify API"
+      });
+      resolve();
+    });
+
+    apiRequest.end();
   });
 });
 
