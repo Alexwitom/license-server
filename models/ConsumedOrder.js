@@ -48,8 +48,9 @@ const ConsumedOrderSchema = new mongoose.Schema({
   }
 });
 
-// Ensure each order can only be consumed once per client
-// This unique index prevents the same orderId from being used multiple times
-ConsumedOrderSchema.index({ clientId: 1, orderId: 1 }, { unique: true });
+// TEMPORARY: Unique index removed to allow multiple uses for testing
+// TODO: REVERT to single-use for production - restore unique index: { clientId: 1, orderId: 1 }, { unique: true }
+// Index for querying consumption count
+ConsumedOrderSchema.index({ clientId: 1, orderId: 1 });
 
 module.exports = mongoose.model("ConsumedOrder", ConsumedOrderSchema);
