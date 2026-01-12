@@ -25,15 +25,16 @@ const Client = require("../models/Client");
  * 
  * This is the SINGLE SOURCE OF TRUTH for client resolution in the service layer.
  * All Shopify operations MUST use this function to ensure multi-client isolation.
+ * clientId is PRIMARY KEY - lookup is strict and isolated per client.
  * 
- * @param {string} clientId - Client identifier (e.g., Discord user ID)
- * @returns {Promise<Object|null>} - Client document with shopify credentials, or null if not found
+ * @param {string} clientId - Client identifier (PRIMARY KEY, e.g., Discord user ID)
+ * @returns {Promise<Object|null>} - Client document with shop and shopifyAccessToken, or null if not found
  * 
  * Example usage in Discord bot:
  *   const client = await getClientByClientId(userId);
- *   if (client && client.shopify && client.shopify.accessToken) {
- *     // Make Shopify API call with client.shopify.accessToken
- *     // Verify order using client.shopify.shop domain
+ *   if (client && client.shop && client.shopifyAccessToken) {
+ *     // Make Shopify API call with client.shopifyAccessToken
+ *     // Verify order using client.shop domain
  *   }
  */
 async function getClientByClientId(clientId) {
@@ -55,22 +56,21 @@ async function getClientByClientId(clientId) {
  * 
  * @deprecated Use getClientByClientId() instead for better multi-client support
  * @param {string} clientId - Client identifier (e.g., Discord user ID)
- * @returns {Promise<Object|null>} - Store data with shop, accessToken, scopes, etc., or null if not found
+ * @returns {Promise<Object|null>} - Store data with shop, accessToken, etc., or null if not found
  */
 async function getStoreByClientId(clientId) {
   const client = await getClientByClientId(clientId);
-  if (!client || !client.shopify) {
+  if (!client || !client.shop || !client.shopifyAccessToken) {
     return null;
   }
   
   // Return in legacy format for backward compatibility
   return {
     clientId: client.clientId,
-    shop: client.shopify.shop,
-    accessToken: client.shopify.accessToken,
-    scopes: client.shopify.scopes,
-    connectedAt: client.shopify.installedAt,
-    lastUsedAt: client.shopify.installedAt // Fallback since Client model doesn't have lastUsedAt
+    shop: client.shop,
+    accessToken: client.shopifyAccessToken,
+    connectedAt: client.createdAt,
+    lastUsedAt: client.createdAt // Fallback since Client model doesn't have lastUsedAt
   };
 }
 
@@ -89,7 +89,7 @@ async function getStoreByClientId(clientId) {
  */
 async function isStoreConnected(clientId) {
   const client = await getClientByClientId(clientId);
-  return client !== null && client !== undefined && client.shopify && client.shopify.accessToken;
+  return client !== null && client !== undefined && client.shop && client.shopifyAccessToken;
 }
 
 module.exports = {
