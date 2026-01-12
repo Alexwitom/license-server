@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Shopify OAuth Setup</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+      background: #f5f5f5;
+      padding: 20px;
+      color: #333;
+    }
+
+    .container {
+      max-width: 600px;
+      margin: 0 auto;
+      background: white;
+      border-radius: 8px;
+      padding: 24px;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+    }
+
+    h2 {
+      font-size: 24px;
+      margin-bottom: 8px;
+      color: #1a1a1a;
+    }
+
+    .subtitle {
+      color: #666;
+      font-size: 14px;
+      margin-bottom: 24px;
+    }
+
+    .form-group {
+      margin-bottom: 20px;
+    }
+
+    label {
+      display: block;
+      font-weight: 500;
+      margin-bottom: 8px;
+      color: #333;
+      font-size: 14px;
+    }
+
+    input[type="text"] {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      font-size: 14px;
+      transition: border-color 0.2s;
+    }
+
+    input[type="text"]:focus {
+      outline: none;
+      border-color: #5e6ad2;
+      box-shadow: 0 0 0 3px rgba(94, 106, 210, 0.1);
+    }
+
+    input[type="text"]:invalid {
+      border-color: #e74c3c;
+    }
+
+    .input-description {
+      font-size: 12px;
+      color: #666;
+      margin-top: 4px;
+    }
+
+    .error-message {
+      display: none;
+      color: #e74c3c;
+      font-size: 12px;
+      margin-top: 4px;
+      padding: 6px 8px;
+      background: #fee;
+      border-radius: 4px;
+      border-left: 3px solid #e74c3c;
+    }
+
+    .error-message.show {
+      display: block;
+    }
+
+    button {
+      width: 100%;
+      padding: 12px 24px;
+      background: #5e6ad2;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background-color 0.2s;
+    }
+
+    button:hover:not(:disabled) {
+      background: #4a56c4;
+    }
+
+    button:disabled {
+      background: #ccc;
+      cursor: not-allowed;
+      opacity: 0.6;
+    }
+
+    .divider {
+      height: 1px;
+      background: #eee;
+      margin: 24px 0;
+    }
+
+    .info-box {
+      background: #f0f7ff;
+      border-left: 3px solid #5e6ad2;
+      padding: 12px;
+      border-radius: 4px;
+      font-size: 13px;
+      color: #555;
+      margin-top: 16px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>Shop → Shopify</h2>
+    <p class="subtitle">Connect your Shopify store to enable order verification</p>
+
+    <form id="shopifyOAuthForm">
+      <div class="form-group">
+        <label for="clientId">Client ID *</label>
+        <input 
+          type="text" 
+          id="clientId" 
+          name="clientId" 
+          placeholder="Enter your client ID"
+          required
+        />
+        <div class="input-description">
+          Your unique client identifier (e.g., Discord user ID, Electron app ID)
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label for="shopDomain">Shop Domain *</label>
+        <input 
+          type="text" 
+          id="shopDomain" 
+          name="shopDomain" 
+          placeholder="mystore.myshopify.com"
+          pattern=".*\.myshopify\.com$"
+          required
+        />
+        <div class="input-description">
+          Your Shopify store domain (must end with .myshopify.com)
+        </div>
+        <div id="shopifyError" class="error-message"></div>
+      </div>
+
+      <button type="button" id="generateShopifyLink" disabled>
+        Generate Shopify Install Link
+      </button>
+    </form>
+
+    <div class="divider"></div>
+
+    <div class="info-box">
+      <strong>How it works:</strong><br>
+      1. Enter your Client ID and Shop domain<br>
+      2. Click "Generate Shopify Install Link"<br>
+      3. You'll be redirected to Shopify to authorize the connection<br>
+      4. After authorization, your store will be connected automatically
+    </div>
+  </div>
+
+  <script>
+    // Initialize Shopify OAuth UI
+    const clientIdInput = document.getElementById('clientId');
+    const shopInput = document.getElementById('shopDomain');
+    const generateButton = document.getElementById('generateShopifyLink');
+    const errorMessage = document.getElementById('shopifyError');
+    
+    // Get backend URL from your Electron config
+    // Adjust this based on how you store your backend URL
+    const backendUrl = window.BACKEND_URL || 'http://localhost:3000';
+
+    // Real-time validation
+    function validateInputs() {
+      const clientId = clientIdInput?.value.trim();
+      const shop = shopInput?.value.trim();
+      
+      // Clear previous errors
+      if (errorMessage) {
+        errorMessage.textContent = '';
+        errorMessage.classList.remove('show');
+      }
+      
+      // Validate clientId
+      if (!clientId || clientId.length === 0) {
+        if (generateButton) generateButton.disabled = true;
+        return false;
+      }
+      
+      // Validate shop domain
+      if (!shop || shop.length === 0) {
+        if (generateButton) generateButton.disabled = true;
+        return false;
+      }
+      
+      // Validate shop domain format (must end with .myshopify.com)
+      if (!shop.endsWith('.myshopify.com')) {
+        if (errorMessage) {
+          errorMessage.textContent = 'Shop domain must end with .myshopify.com';
+          errorMessage.classList.add('show');
+        }
+        if (generateButton) generateButton.disabled = true;
+        return false;
+      }
+      
+      // All validations passed
+      if (generateButton) generateButton.disabled = false;
+      return true;
+    }
+
+    // Attach event listeners for real-time validation
+    if (clientIdInput) {
+      clientIdInput.addEventListener('input', validateInputs);
+      clientIdInput.addEventListener('blur', validateInputs);
+    }
+    
+    if (shopInput) {
+      shopInput.addEventListener('input', validateInputs);
+      shopInput.addEventListener('blur', validateInputs);
+    }
+
+    // Handle generate button click
+    if (generateButton) {
+      generateButton.addEventListener('click', () => {
+        const clientId = clientIdInput?.value.trim();
+        const shop = shopInput?.value.trim();
+        
+        // Final validation before generating URL
+        if (!validateInputs()) {
+          return;
+        }
+        
+        // Generate OAuth URL with both clientId and shop
+        const oauthUrl = `${backendUrl}/shopify/auth?clientId=${encodeURIComponent(clientId)}&shop=${encodeURIComponent(shop)}`;
+        
+        // Open in system browser (NOT Electron's internal browser)
+        // This requires Electron's shell module
+        if (typeof require !== 'undefined') {
+          try {
+            const { shell } = require('electron').remote || require('@electron/remote') || require('electron');
+            shell.openExternal(oauthUrl);
+            console.log('✅ Opening Shopify OAuth URL in system browser:', oauthUrl);
+          } catch (error) {
+            console.error('❌ Error opening external browser:', error);
+            // Fallback: show URL to user
+            alert(`Please open this URL in your browser:\n\n${oauthUrl}`);
+          }
+        } else {
+          // Fallback for development/testing
+          console.log('OAuth URL:', oauthUrl);
+          window.open(oauthUrl, '_blank');
+        }
+      });
+    }
+
+    // Initial validation
+    validateInputs();
+  </script>
+</body>
+</html>
