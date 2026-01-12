@@ -633,30 +633,155 @@ app.get("/shopify/callback", async (req, res) => {
 });
 
 /**
+ * WooCommerce API Helper Functions
+ * 
+ * These functions handle WooCommerce REST API authentication and order fetching.
+ * WooCommerce uses HTTP Basic Auth with consumer key and consumer secret.
+ */
+
+/**
+ * Make authenticated WooCommerce API request
+ * @param {string} storeUrl - WooCommerce store URL (e.g., "https://example.com")
+ * @param {string} consumerKey - WooCommerce consumer key
+ * @param {string} consumerSecret - WooCommerce consumer secret
+ * @param {string} endpoint - API endpoint path (e.g., "/wp-json/wc/v3/orders")
+ * @returns {Promise<Object>} - Parsed JSON response
+ */
+function makeWooCommerceRequest(storeUrl, consumerKey, consumerSecret, endpoint) {
+  return new Promise((resolve, reject) => {
+    // Normalize store URL (remove trailing slash, ensure https)
+    let normalizedUrl = storeUrl.trim();
+    if (!normalizedUrl.startsWith("http://") && !normalizedUrl.startsWith("https://")) {
+      normalizedUrl = "https://" + normalizedUrl;
+    }
+    normalizedUrl = normalizedUrl.replace(/\/$/, "");
+
+    // Parse URL
+    const url = new URL(normalizedUrl + endpoint);
+    const isHttps = url.protocol === "https:";
+
+    // WooCommerce uses HTTP Basic Auth
+    const auth = Buffer.from(`${consumerKey}:${consumerSecret}`).toString("base64");
+
+    const options = {
+      hostname: url.hostname,
+      port: url.port || (isHttps ? 443 : 80),
+      path: url.pathname + url.search,
+      method: "GET",
+      headers: {
+        "Authorization": `Basic ${auth}`,
+        "Content-Type": "application/json"
+      }
+    };
+
+    const httpModule = isHttps ? https : require("http");
+    const apiRequest = httpModule.request(options, (apiResponse) => {
+      let data = "";
+
+      apiResponse.on("data", (chunk) => {
+        data += chunk;
+      });
+
+      apiResponse.on("end", () => {
+        if (apiResponse.statusCode === 200 || apiResponse.statusCode === 201) {
+          try {
+            const responseData = JSON.parse(data);
+            resolve(responseData);
+          } catch (parseError) {
+            reject(new Error(`Failed to parse WooCommerce response: ${parseError.message}`));
+          }
+        } else {
+          reject(new Error(`WooCommerce API error ${apiResponse.statusCode}: ${data.substring(0, 200)}`));
+        }
+      });
+    });
+
+    apiRequest.on("error", (err) => {
+      reject(err);
+    });
+
+    apiRequest.end();
+  });
+}
+
+/**
+ * Fetch WooCommerce orders by customer email
+ * @param {string} storeUrl - WooCommerce store URL
+ * @param {string} consumerKey - WooCommerce consumer key
+ * @param {string} consumerSecret - WooCommerce consumer secret
+ * @param {string} email - Customer email address
+ * @returns {Promise<Array>} - Array of paid orders matching the email
+ */
+async function fetchWooCommerceOrdersByEmail(storeUrl, consumerKey, consumerSecret, email) {
+  try {
+    // WooCommerce API: search orders by customer email
+    // Note: WooCommerce API doesn't have direct email filter, so we fetch recent orders and filter
+    const endpoint = `/wp-json/wc/v3/orders?per_page=100&status=any`;
+    const orders = await makeWooCommerceRequest(storeUrl, consumerKey, consumerSecret, endpoint);
+
+    // Filter orders by email (case-insensitive) and status = "completed" or "processing" (paid)
+    const emailLower = email.toLowerCase().trim();
+    const paidOrders = orders.filter(order => {
+      const orderEmail = (order.billing?.email || "").toLowerCase().trim();
+      const isPaid = order.status === "completed" || order.status === "processing";
+      return orderEmail === emailLower && isPaid;
+    });
+
+    return paidOrders;
+  } catch (error) {
+    console.error("❌ Error fetching WooCommerce orders:", error);
+    throw error;
+  }
+}
+
+/**
+ * Fetch WooCommerce order by ID
+ * @param {string} storeUrl - WooCommerce store URL
+ * @param {string} consumerKey - WooCommerce consumer key
+ * @param {string} consumerSecret - WooCommerce consumer secret
+ * @param {string} orderId - WooCommerce order ID
+ * @returns {Promise<Object|null>} - Order object or null if not found
+ */
+async function fetchWooCommerceOrderById(storeUrl, consumerKey, consumerSecret, orderId) {
+  try {
+    const endpoint = `/wp-json/wc/v3/orders/${orderId}`;
+    const order = await makeWooCommerceRequest(storeUrl, consumerKey, consumerSecret, endpoint);
+    return order;
+  } catch (error) {
+    if (error.message.includes("404")) {
+      return null; // Order not found
+    }
+    throw error;
+  }
+}
+
+/**
  * GET /shopify/verify-order
- * Verifies if a customer has a paid order in the client's Shopify store
+ * Verifies if a customer has a paid order in the client's e-commerce store
+ * Supports both Shopify and WooCommerce platforms
  * 
  * Query params:
  *   - clientId: Client identifier (e.g., Discord user ID)
  *   - email: Customer email address to check
  * 
  * Usage in Discord Bot:
- *   - User claims to have purchased from a Shopify store
+ *   - User claims to have purchased from a store
  *   - Bot calls this endpoint with user's Discord ID as clientId and their email
  *   - Bot receives hasOrder flag to grant access or permissions
  *   - Bot can display orderId for confirmation if needed
  * 
  * Flow:
  * 1. Validates required query parameters (clientId, email)
- * 2. Loads client and Shopify credentials from MongoDB using getClientByClientId(clientId)
- *    - Multi-client architecture: Each client has isolated Shopify credentials
- *    - Returns STORE_NOT_FOUND if client doesn't exist or hasn't connected Shopify
- * 3. Makes authenticated request to Shopify Admin API using client's shop and accessToken
- * 4. Filters orders by email (case-insensitive) and financial_status = "paid"
- * 5. Returns whether a paid order exists and the order ID if found
+ * 2. Loads client and platform credentials from MongoDB using getClientByClientId(clientId)
+ *    - Multi-client architecture: Each client has isolated store credentials
+ *    - Returns CLIENT_NOT_FOUND if client doesn't exist or hasn't connected a store
+ * 3. Detects platform (shopify or woocommerce)
+ * 4. Makes authenticated request to appropriate API (Shopify Admin API or WooCommerce REST API)
+ * 5. Filters orders by email (case-insensitive) and payment status
+ * 6. Returns whether a paid order exists and the order ID if found
  * 
  * Multi-client isolation:
- * - Each clientId resolves to their own Shopify store
+ * - Each clientId resolves to their own store
  * - No cross-client data access
  * - Scalable to hundreds of clients
  */
@@ -672,16 +797,16 @@ app.get("/shopify/verify-order", async (req, res) => {
     });
   }
 
-  // Load client and Shopify credentials from MongoDB (multi-client architecture)
+  // Load client and platform credentials from MongoDB (multi-client architecture)
   // clientId is PRIMARY KEY - lookup is strict and isolated per client
   let client;
   try {
     client = await getClientByClientId(clientId);
-    if (!client || !client.shop || !client.shopifyAccessToken) {
+    if (!client) {
       return res.status(404).json({
         ok: false,
         reason: "CLIENT_NOT_FOUND",
-        message: "No Shopify store connected for this clientId"
+        message: "No store connected for this clientId"
       });
     }
   } catch (dbError) {
@@ -693,103 +818,157 @@ app.get("/shopify/verify-order", async (req, res) => {
     });
   }
 
-  // Extract Shopify credentials from client document (multi-client isolation)
-  const shop = client.shop;
-  const accessToken = client.shopifyAccessToken;
+  // Detect platform (default to "shopify" for backward compatibility)
+  const platform = client.platform || "shopify";
+  console.log(`[VERIFY] Platform: ${platform}, clientId: ${clientId}`);
 
-  // Prepare Shopify API request
-  // Use Shopify Admin REST API to fetch orders
-  // API version can be configured via env var, default to stable version
-  const apiVersion = process.env.SHOPIFY_API_VERSION || "2024-01";
-  const apiPath = `/admin/api/${apiVersion}/orders.json?status=any&limit=250`;
+  // Validate platform-specific credentials
+  if (platform === "shopify") {
+    if (!client.shop || !client.shopifyAccessToken) {
+      return res.status(404).json({
+        ok: false,
+        reason: "CLIENT_NOT_FOUND",
+        message: "No Shopify store connected for this clientId"
+      });
+    }
+  } else if (platform === "woocommerce") {
+    if (!client.storeUrl || !client.consumerKey || !client.consumerSecret) {
+      return res.status(404).json({
+        ok: false,
+        reason: "CLIENT_NOT_FOUND",
+        message: "No WooCommerce store connected for this clientId"
+      });
+    }
+  } else {
+    return res.status(400).json({
+      ok: false,
+      reason: "INVALID_PLATFORM",
+      message: `Unsupported platform: ${platform}`
+    });
+  }
 
-  return new Promise((resolve) => {
-    const apiRequest = https.request(
-      {
-        hostname: shop,
-        path: apiPath,
-        method: "GET",
-        headers: {
-          "X-Shopify-Access-Token": accessToken,
-          "Content-Type": "application/json"
-        }
-      },
-      (apiResponse) => {
-        let data = "";
+  // Verify order based on platform
+  try {
+    if (platform === "shopify") {
+      // Shopify order verification
+      const shop = client.shop;
+      const accessToken = client.shopifyAccessToken;
 
-        apiResponse.on("data", (chunk) => {
-          data += chunk;
-        });
+      // Prepare Shopify API request
+      const apiVersion = process.env.SHOPIFY_API_VERSION || "2024-01";
+      const apiPath = `/admin/api/${apiVersion}/orders.json?status=any&limit=250`;
 
-        apiResponse.on("end", () => {
-          // Handle non-200 responses from Shopify API
-          if (apiResponse.statusCode !== 200) {
-            console.error(`❌ Shopify API error (${apiResponse.statusCode}):`, data);
-            return res.status(500).json({
-              ok: false,
-              reason: "SHOPIFY_API_ERROR",
-              message: "Failed to fetch orders from Shopify"
+      return new Promise((resolve) => {
+        const apiRequest = https.request(
+          {
+            hostname: shop,
+            path: apiPath,
+            method: "GET",
+            headers: {
+              "X-Shopify-Access-Token": accessToken,
+              "Content-Type": "application/json"
+            }
+          },
+          (apiResponse) => {
+            let data = "";
+
+            apiResponse.on("data", (chunk) => {
+              data += chunk;
+            });
+
+            apiResponse.on("end", () => {
+              if (apiResponse.statusCode !== 200) {
+                console.error(`❌ Shopify API error (${apiResponse.statusCode}):`, data);
+                return res.status(500).json({
+                  ok: false,
+                  reason: "SHOPIFY_API_ERROR",
+                  message: "Failed to fetch orders from Shopify"
+                });
+              }
+
+              try {
+                const responseData = JSON.parse(data);
+                const orders = responseData.orders || [];
+
+                // Filter orders by email (case-insensitive) and financial_status = "paid"
+                const emailLower = email.toLowerCase().trim();
+                const paidOrder = orders.find(order => {
+                  const orderEmail = (order.email || "").toLowerCase().trim();
+                  return orderEmail === emailLower && order.financial_status === "paid";
+                });
+
+                console.log(`[VERIFY] Shopify result: hasOrder=${paidOrder !== undefined}, orderId=${paidOrder ? paidOrder.id : null}`);
+
+                res.json({
+                  ok: true,
+                  hasOrder: paidOrder !== undefined,
+                  orderId: paidOrder ? String(paidOrder.id) : null
+                });
+              } catch (parseError) {
+                console.error("❌ Failed to parse Shopify API response:", parseError);
+                res.status(500).json({
+                  ok: false,
+                  reason: "PARSE_ERROR",
+                  message: "Invalid response from Shopify API"
+                });
+              }
+
+              resolve();
             });
           }
+        );
 
-          try {
-            // Parse Shopify API response
-            const responseData = JSON.parse(data);
-            const orders = responseData.orders || [];
-
-            // Filter orders by email (case-insensitive) and financial_status = "paid"
-            const emailLower = email.toLowerCase().trim();
-            const paidOrder = orders.find(order => {
-              const orderEmail = (order.email || "").toLowerCase().trim();
-              return orderEmail === emailLower && order.financial_status === "paid";
-            });
-
-            // Return verification result
-            res.json({
-              ok: true,
-              hasOrder: paidOrder !== undefined,
-              orderId: paidOrder ? String(paidOrder.id) : null
-            });
-          } catch (parseError) {
-            console.error("❌ Failed to parse Shopify API response:", parseError);
-            res.status(500).json({
-              ok: false,
-              reason: "PARSE_ERROR",
-              message: "Invalid response from Shopify API"
-            });
-          }
-
+        apiRequest.on("error", (err) => {
+          console.error("❌ Request error during Shopify API call:", err);
+          res.status(500).json({
+            ok: false,
+            reason: "REQUEST_ERROR",
+            message: "Failed to communicate with Shopify API"
+          });
           resolve();
         });
-      }
-    );
 
-    apiRequest.on("error", (err) => {
-      console.error("❌ Request error during Shopify API call:", err);
-      res.status(500).json({
-        ok: false,
-        reason: "REQUEST_ERROR",
-        message: "Failed to communicate with Shopify API"
+        apiRequest.end();
       });
-      resolve();
-    });
+    } else if (platform === "woocommerce") {
+      // WooCommerce order verification
+      const storeUrl = client.storeUrl;
+      const consumerKey = client.consumerKey;
+      const consumerSecret = client.consumerSecret;
 
-    apiRequest.end();
-  });
+      const paidOrders = await fetchWooCommerceOrdersByEmail(storeUrl, consumerKey, consumerSecret, email);
+
+      console.log(`[VERIFY] WooCommerce result: hasOrder=${paidOrders.length > 0}, orderCount=${paidOrders.length}`);
+
+      res.json({
+        ok: true,
+        hasOrder: paidOrders.length > 0,
+        orderId: paidOrders.length > 0 ? String(paidOrders[0].id) : null
+      });
+    }
+  } catch (apiError) {
+    console.error(`❌ ${platform} API error:`, apiError);
+    return res.status(500).json({
+      ok: false,
+      reason: `${platform.toUpperCase()}_API_ERROR`,
+      message: `Failed to fetch orders from ${platform}`
+    });
+  }
 });
 
 /**
  * POST /shopify/consume-order
- * Marks a Shopify order as consumed (used) for Discord role access
+ * Marks an e-commerce order as consumed (used) for Discord role access
+ * Supports both Shopify and WooCommerce platforms
  * 
  * Request body:
  *   - clientId: Client identifier (store owner's ID)
- *   - orderId: Shopify order ID (explicit, required)
+ *   - orderId: Order ID (explicit, required) - Shopify numeric ID or WooCommerce order ID
  *   - email: Customer email address
  *   - discordUserId: Discord user ID who is consuming the order
  * 
  * Usage in Discord Bot:
- *   - User provides their Shopify order ID
+ *   - User provides their order ID
  *   - Bot calls this endpoint to mark the order as consumed
  *   - Bot grants Discord role based on successful consumption
  * 
@@ -800,14 +979,15 @@ app.get("/shopify/verify-order", async (req, res) => {
  * 
  * Flow:
  * 1. Validates required request body fields (clientId, orderId, email, discordUserId)
- * 2. Loads client and Shopify credentials from MongoDB using getClientByClientId(clientId)
- *    - Multi-client architecture: Each client has isolated Shopify credentials
- *    - Returns STORE_NOT_FOUND if client doesn't exist or hasn't connected Shopify
- * 3. Fetches specific order by orderId from Shopify API using client's shop and accessToken
- * 4. Verifies order exists, is paid, and email matches
- * 5. Counts how many times this orderId has already been consumed
- * 6. If count < MAX_ORDER_USES, stores new consumption record
- * 7. Returns success with orderId
+ * 2. Loads client and platform credentials from MongoDB using getClientByClientId(clientId)
+ *    - Multi-client architecture: Each client has isolated store credentials
+ *    - Returns CLIENT_NOT_FOUND if client doesn't exist or hasn't connected a store
+ * 3. Detects platform (shopify or woocommerce)
+ * 4. Fetches specific order by orderId from appropriate API (Shopify or WooCommerce)
+ * 5. Verifies order exists, is paid, and email matches
+ * 6. Counts how many times this orderId has already been consumed
+ * 7. If count < MAX_ORDER_USES, stores new consumption record
+ * 8. Returns success with orderId
  */
 
 // TEMPORARY TESTING CONSTANT - REMOVE FOR PRODUCTION
@@ -898,24 +1078,20 @@ app.post("/shopify/consume-order", async (req, res) => {
     const inputType = normalizedOrderId.length > 10 ? "id" : "order_number";
     console.log("[DEBUG] Input type detected:", inputType);
 
-    // Load client and Shopify credentials from MongoDB (multi-client architecture)
+    // Load client and platform credentials from MongoDB (multi-client architecture)
     // clientId is PRIMARY KEY - lookup is strict and isolated per client
     // Multi-tenant safe: Use EXACT clientId from request, no fallbacks
     let client;
     try {
       client = await getClientByClientId(clientId);
-      // Return explicit CLIENT_NOT_FOUND error if client doesn't exist
-      if (!client || !client.shop || !client.shopifyAccessToken) {
-        console.log(`[CLAIM] Client NOT found or not connected: clientId=${clientId}`);
+      if (!client) {
+        console.log(`[CLAIM] Client NOT found: clientId=${clientId}`);
         return res.status(404).json({
           ok: false,
           reason: "CLIENT_NOT_FOUND",
-          message: `No Shopify store connected for clientId: ${clientId}`
+          message: `No store connected for clientId: ${clientId}`
         });
       }
-      
-      // TEMP DEBUG: Log shop domain used
-      console.log("[DEBUG] Shop domain used:", client.shop);
     } catch (dbError) {
       console.error(`❌ Database error loading client (clientId=${clientId}):`, dbError);
       return res.status(500).json({
@@ -924,168 +1100,236 @@ app.post("/shopify/consume-order", async (req, res) => {
       });
     }
 
-    // Extract Shopify credentials from client document (multi-client isolation)
-    const shop = client.shop;
-    const accessToken = client.shopifyAccessToken;
+    // Detect platform (default to "shopify" for backward compatibility)
+    const platform = client.platform || "shopify";
+    console.log(`[CLAIM] Platform: ${platform}, clientId: ${clientId}`);
 
-    // Helper function to fetch order by Shopify ID
-    const fetchOrderById = (orderId) => {
-      return new Promise((resolve, reject) => {
-        const apiVersion = process.env.SHOPIFY_API_VERSION || "2024-01";
-        const apiPath = `/admin/api/${apiVersion}/orders/${orderId}.json`;
-
-        const apiRequest = https.request(
-          {
-            hostname: shop,
-            path: apiPath,
-            method: "GET",
-            headers: {
-              "X-Shopify-Access-Token": accessToken,
-              "Content-Type": "application/json"
-            }
-          },
-          (apiResponse) => {
-            let data = "";
-
-            apiResponse.on("data", (chunk) => {
-              data += chunk;
-            });
-
-            apiResponse.on("end", () => {
-              if (apiResponse.statusCode === 200) {
-                try {
-                  const responseData = JSON.parse(data);
-                  resolve(responseData.order);
-                } catch (parseError) {
-                  reject(new Error(`Failed to parse response: ${parseError.message}`));
-                }
-              } else if (apiResponse.statusCode === 404) {
-                resolve(null); // Order not found
-              } else {
-                reject(new Error(`API error ${apiResponse.statusCode}: ${data}`));
-              }
-            });
-          }
-        );
-
-        apiRequest.on("error", (err) => {
-          reject(err);
+    // Validate platform-specific credentials
+    if (platform === "shopify") {
+      if (!client.shop || !client.shopifyAccessToken) {
+        console.log(`[CLAIM] Shopify store not connected: clientId=${clientId}`);
+        return res.status(404).json({
+          ok: false,
+          reason: "CLIENT_NOT_FOUND",
+          message: `No Shopify store connected for clientId: ${clientId}`
         });
-
-        apiRequest.end();
-      });
-    };
-
-    // Helper function to fetch orders list and find by order_number
-    const fetchOrderByOrderNumber = (orderNumber) => {
-      return new Promise((resolve, reject) => {
-        const apiVersion = process.env.SHOPIFY_API_VERSION || "2024-01";
-        const apiPath = `/admin/api/${apiVersion}/orders.json?status=any&limit=50`;
-
-        const apiRequest = https.request(
-          {
-            hostname: shop,
-            path: apiPath,
-            method: "GET",
-            headers: {
-              "X-Shopify-Access-Token": accessToken,
-              "Content-Type": "application/json"
-            }
-          },
-          (apiResponse) => {
-            let data = "";
-
-            apiResponse.on("data", (chunk) => {
-              data += chunk;
-            });
-
-            apiResponse.on("end", () => {
-              if (apiResponse.statusCode === 200) {
-                try {
-                  const responseData = JSON.parse(data);
-                  const orders = responseData.orders || [];
-                  
-                  // TEMP DEBUG: Log total orders scanned
-                  console.log("[DEBUG] Total orders scanned:", orders.length);
-                  
-                  // Find order where order.order_number matches the input (as number)
-                  const targetOrderNumber = Number(orderNumber);
-                  const foundOrder = orders.find(order => {
-                    return order.order_number === targetOrderNumber;
-                  });
-                  
-                  resolve(foundOrder || null);
-                } catch (parseError) {
-                  reject(new Error(`Failed to parse response: ${parseError.message}`));
-                }
-              } else {
-                reject(new Error(`API error ${apiResponse.statusCode}: ${data}`));
-              }
-            });
-          }
-        );
-
-        apiRequest.on("error", (err) => {
-          reject(err);
-        });
-
-        apiRequest.end();
-      });
-    };
-
-    // Fetch order based on input type
-    let order = null;
-    try {
-      if (inputType === "id") {
-        // Fetch directly by Shopify order ID
-        order = await fetchOrderById(normalizedOrderId);
-      } else {
-        // Fetch recent orders and find by order_number
-        order = await fetchOrderByOrderNumber(normalizedOrderId);
       }
+    } else if (platform === "woocommerce") {
+      if (!client.storeUrl || !client.consumerKey || !client.consumerSecret) {
+        console.log(`[CLAIM] WooCommerce store not connected: clientId=${clientId}`);
+        return res.status(404).json({
+          ok: false,
+          reason: "CLIENT_NOT_FOUND",
+          message: `No WooCommerce store connected for clientId: ${clientId}`
+        });
+      }
+    } else {
+      return res.status(400).json({
+        ok: false,
+        reason: "INVALID_PLATFORM",
+        message: `Unsupported platform: ${platform}`
+      });
+    }
+
+    // Fetch order based on platform
+    let order = null;
+    let verifiedOrderId = null;
+
+    try {
+      if (platform === "shopify") {
+        // Shopify order fetching logic
+        const shop = client.shop;
+        const accessToken = client.shopifyAccessToken;
+
+        // Helper function to fetch order by Shopify ID
+        const fetchOrderById = (orderId) => {
+          return new Promise((resolve, reject) => {
+            const apiVersion = process.env.SHOPIFY_API_VERSION || "2024-01";
+            const apiPath = `/admin/api/${apiVersion}/orders/${orderId}.json`;
+
+            const apiRequest = https.request(
+              {
+                hostname: shop,
+                path: apiPath,
+                method: "GET",
+                headers: {
+                  "X-Shopify-Access-Token": accessToken,
+                  "Content-Type": "application/json"
+                }
+              },
+              (apiResponse) => {
+                let data = "";
+
+                apiResponse.on("data", (chunk) => {
+                  data += chunk;
+                });
+
+                apiResponse.on("end", () => {
+                  if (apiResponse.statusCode === 200) {
+                    try {
+                      const responseData = JSON.parse(data);
+                      resolve(responseData.order);
+                    } catch (parseError) {
+                      reject(new Error(`Failed to parse response: ${parseError.message}`));
+                    }
+                  } else if (apiResponse.statusCode === 404) {
+                    resolve(null); // Order not found
+                  } else {
+                    reject(new Error(`API error ${apiResponse.statusCode}: ${data}`));
+                  }
+                });
+              }
+            );
+
+            apiRequest.on("error", (err) => {
+              reject(err);
+            });
+
+            apiRequest.end();
+          });
+        };
+
+        // Helper function to fetch orders list and find by order_number
+        const fetchOrderByOrderNumber = (orderNumber) => {
+          return new Promise((resolve, reject) => {
+            const apiVersion = process.env.SHOPIFY_API_VERSION || "2024-01";
+            const apiPath = `/admin/api/${apiVersion}/orders.json?status=any&limit=50`;
+
+            const apiRequest = https.request(
+              {
+                hostname: shop,
+                path: apiPath,
+                method: "GET",
+                headers: {
+                  "X-Shopify-Access-Token": accessToken,
+                  "Content-Type": "application/json"
+                }
+              },
+              (apiResponse) => {
+                let data = "";
+
+                apiResponse.on("data", (chunk) => {
+                  data += chunk;
+                });
+
+                apiResponse.on("end", () => {
+                  if (apiResponse.statusCode === 200) {
+                    try {
+                      const responseData = JSON.parse(data);
+                      const orders = responseData.orders || [];
+                      
+                      // TEMP DEBUG: Log total orders scanned
+                      console.log("[DEBUG] Total orders scanned:", orders.length);
+                      
+                      // Find order where order.order_number matches the input (as number)
+                      const targetOrderNumber = Number(orderNumber);
+                      const foundOrder = orders.find(order => {
+                        return order.order_number === targetOrderNumber;
+                      });
+                      
+                      resolve(foundOrder || null);
+                    } catch (parseError) {
+                      reject(new Error(`Failed to parse response: ${parseError.message}`));
+                    }
+                  } else {
+                    reject(new Error(`API error ${apiResponse.statusCode}: ${data}`));
+                  }
+                });
+              }
+            );
+
+            apiRequest.on("error", (err) => {
+              reject(err);
+            });
+
+            apiRequest.end();
+          });
+        };
+
+        // Fetch order based on input type
+        if (inputType === "id") {
+          // Fetch directly by Shopify order ID
+          order = await fetchOrderById(normalizedOrderId);
+        } else {
+          // Fetch recent orders and find by order_number
+          order = await fetchOrderByOrderNumber(normalizedOrderId);
+        }
+
+        if (!order) {
+          return res.status(404).json({
+            ok: false,
+            reason: "ORDER_NOT_FOUND"
+          });
+        }
+
+        // Extract the REAL Shopify order ID
+        verifiedOrderId = String(order.id);
+        console.log(`[CLAIM] Shopify order ID resolved: ${verifiedOrderId}`);
+
+        // Verify order is paid
+        if (order.financial_status !== "paid") {
+          return res.status(400).json({
+            ok: false,
+            reason: "ORDER_NOT_PAID"
+          });
+        }
+
+        // Verify order email matches provided email (case-insensitive)
+        const orderEmail = (order.email || "").toLowerCase().trim();
+        console.log(`[CLAIM] Shopify email check: orderEmail=${orderEmail}, requestEmail=${email}`);
+        
+        if (orderEmail !== email) {
+          return res.status(400).json({
+            ok: false,
+            reason: "ORDER_EMAIL_MISMATCH"
+          });
+        }
+
+      } else if (platform === "woocommerce") {
+        // WooCommerce order fetching logic
+        const storeUrl = client.storeUrl;
+        const consumerKey = client.consumerKey;
+        const consumerSecret = client.consumerSecret;
+
+        // WooCommerce uses numeric order IDs directly (no order_number concept like Shopify)
+        order = await fetchWooCommerceOrderById(storeUrl, consumerKey, consumerSecret, normalizedOrderId);
+
+        if (!order) {
+          return res.status(404).json({
+            ok: false,
+            reason: "ORDER_NOT_FOUND"
+          });
+        }
+
+        // Extract WooCommerce order ID
+        verifiedOrderId = String(order.id);
+        console.log(`[CLAIM] WooCommerce order ID resolved: ${verifiedOrderId}`);
+
+        // Verify order is paid (WooCommerce: status must be "completed" or "processing")
+        if (order.status !== "completed" && order.status !== "processing") {
+          return res.status(400).json({
+            ok: false,
+            reason: "ORDER_NOT_PAID"
+          });
+        }
+
+        // Verify order email matches provided email (case-insensitive)
+        const orderEmail = (order.billing?.email || "").toLowerCase().trim();
+        console.log(`[CLAIM] WooCommerce email check: orderEmail=${orderEmail}, requestEmail=${email}`);
+        
+        if (orderEmail !== email) {
+          return res.status(400).json({
+            ok: false,
+            reason: "ORDER_EMAIL_MISMATCH"
+          });
+        }
+      }
+
     } catch (fetchError) {
-      console.error("❌ Error fetching order from Shopify:", fetchError);
+      console.error(`❌ Error fetching order from ${platform}:`, fetchError);
       return res.status(500).json({
         ok: false,
         reason: "INTERNAL_ERROR"
-      });
-    }
-
-    // Verify order exists
-    if (!order) {
-      return res.status(404).json({
-        ok: false,
-        reason: "ORDER_NOT_FOUND"
-      });
-    }
-
-    // Extract the REAL Shopify order ID from the order object
-    // IMPORTANT: Use ONLY this real ID for email comparison, consumed-order lookup, and reuse limits
-    const verifiedOrderId = String(order.id);
-    
-    // TEMP DEBUG: Log resolved Shopify order ID
-    console.log("[DEBUG] Resolved Shopify order ID:", verifiedOrderId);
-
-    // Verify order is paid
-    if (order.financial_status !== "paid") {
-      return res.status(400).json({
-        ok: false,
-        reason: "ORDER_NOT_PAID"
-      });
-    }
-
-    // Verify order email matches provided email (case-insensitive)
-    const orderEmail = (order.email || "").toLowerCase().trim();
-    
-    // TEMP DEBUG: Log email comparison
-    console.log("[DEBUG] Email from Shopify:", orderEmail);
-    console.log("[DEBUG] Email from request:", email);
-    console.log("[DEBUG] Email match result:", orderEmail === email ? "MATCH" : "MISMATCH");
-    
-    if (orderEmail !== email) {
-      return res.status(400).json({
-        ok: false,
-        reason: "ORDER_EMAIL_MISMATCH"
       });
     }
 
@@ -1144,6 +1388,136 @@ app.post("/shopify/consume-order", async (req, res) => {
     return res.status(500).json({
       ok: false,
       reason: "INTERNAL_ERROR"
+    });
+  }
+});
+
+/**
+ * POST /client/theme
+ * Updates or sets the theme color for a client
+ * 
+ * Request body:
+ *   - clientId: Client identifier (required)
+ *   - color: HEX color code (required, format: #RRGGBB)
+ * 
+ * Usage:
+ *   - Client selects a theme color in UI
+ *   - Frontend calls this endpoint to save the preference
+ *   - Color is stored per clientId for future use
+ * 
+ * Flow:
+ * 1. Validates required fields (clientId, color)
+ * 2. Validates HEX color format (#RRGGBB)
+ * 3. Upserts client document by clientId
+ * 4. Saves theme.color to MongoDB
+ * 5. Returns success with saved color
+ * 
+ * Multi-client support:
+ * - Each clientId has its own theme color
+ * - Safe for hundreds of clients
+ * - Upsert creates client if it doesn't exist
+ */
+app.post("/client/theme", async (req, res) => {
+  try {
+    // DEFENSIVE LAYER 1: Safe JSON parsing if body is a string
+    let body = req.body;
+    if (typeof body === 'string') {
+      try {
+        body = JSON.parse(body);
+      } catch (parseError) {
+        return res.status(400).json({
+          ok: false,
+          reason: "INVALID_REQUEST",
+          message: "Invalid JSON in request body"
+        });
+      }
+    }
+
+    // DEFENSIVE LAYER 2: Ensure body is an object
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return res.status(400).json({
+        ok: false,
+        reason: "INVALID_REQUEST",
+        message: "Request body must be a JSON object"
+      });
+    }
+
+    // DEFENSIVE LAYER 3: Extract and validate clientId
+    const rawClientId = body.clientId;
+    if (!rawClientId || (typeof rawClientId === "string" && rawClientId.trim().length === 0)) {
+      return res.status(400).json({
+        ok: false,
+        reason: "INVALID_REQUEST",
+        message: "clientId is required"
+      });
+    }
+    const clientId = String(rawClientId).trim();
+
+    // DEFENSIVE LAYER 4: Extract and validate color
+    const rawColor = body.color;
+    if (!rawColor || typeof rawColor !== "string") {
+      return res.status(400).json({
+        ok: false,
+        reason: "INVALID_COLOR",
+        message: "color is required and must be a string"
+      });
+    }
+
+    // Normalize color: trim and ensure uppercase
+    let color = String(rawColor).trim().toUpperCase();
+
+    // Validate HEX color format (#RRGGBB)
+    // Must start with # and have exactly 6 hex characters
+    const hexColorRegex = /^#[0-9A-F]{6}$/;
+    if (!hexColorRegex.test(color)) {
+      return res.status(400).json({
+        ok: false,
+        reason: "INVALID_COLOR",
+        message: "color must be a valid HEX color in format #RRGGBB (e.g., #22C55E)"
+      });
+    }
+
+    // Log theme update
+    console.log(`🎨 Theme update: clientId=${clientId}, color=${color}`);
+
+    // Upsert client document with theme color
+    try {
+      const client = await Client.findOneAndUpdate(
+        { clientId: clientId },
+        {
+          $set: {
+            "theme.color": color
+          }
+        },
+        {
+          upsert: true,
+          new: true,
+          setDefaultsOnInsert: true
+        }
+      );
+
+      // Return success response
+      return res.json({
+        ok: true,
+        message: "Theme updated",
+        color: color
+      });
+    } catch (dbError) {
+      console.error(`❌ Database error updating theme (clientId=${clientId}):`, dbError);
+      return res.status(500).json({
+        ok: false,
+        reason: "INTERNAL_ERROR",
+        message: "Failed to update theme"
+      });
+    }
+
+  } catch (error) {
+    // FINAL CRASH-PROOF LAYER: Catch any unhandled errors
+    console.error("❌ Unhandled error in /client/theme:", error);
+    return res.status(500).json({
+      ok: false,
+      reason: "INTERNAL_ERROR",
+      message: "An unexpected error occurred"
     });
   }
 });
