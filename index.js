@@ -1479,23 +1479,23 @@ app.post("/shopify/consume-order", async (req, res) => {
 
 /**
  * POST /client/theme
- * Updates the theme color for an existing client
+ * Updates the theme preset for an existing client
  * 
  * Request body:
  *   - clientId: Client identifier (required)
- *   - color: HEX color code (required, format: #RRGGBB)
+ *   - preset: Theme preset name (required, e.g., "dark_green", "light_blue")
  * 
  * Usage:
- *   - Client selects a theme color in UI
+ *   - Client selects a theme preset in UI
  *   - Frontend calls this endpoint to save the preference
- *   - Color is stored per clientId for future use
+ *   - Preset is stored per clientId for future use
  * 
  * Flow:
- * 1. Validates required fields (clientId, color)
- * 2. Validates HEX color format (#RRGGBB)
+ * 1. Validates required fields (clientId, preset)
+ * 2. Validates preset is a non-empty string
  * 3. Checks if client exists (MUST exist - no implicit creation)
- * 4. Updates theme.color using updateOne with upsert: false
- * 5. Returns success with saved color
+ * 4. Updates theme.preset using updateOne with upsert: false
+ * 5. Returns success with saved preset
  * 
  * CRITICAL RULES:
  * - Client document MUST exist before saving theme
@@ -1504,7 +1504,7 @@ app.post("/shopify/consume-order", async (req, res) => {
  * - Returns CLIENT_NOT_FOUND error if client doesn't exist
  * 
  * Multi-client support:
- * - Each clientId has its own theme color
+ * - Each clientId has its own theme preset
  * - Safe for hundreds of clients
  * - One clientId = one Mongo document
  */
@@ -1553,32 +1553,21 @@ app.post("/client/theme", async (req, res) => {
     const clientId = String(rawClientId).trim();
     console.log(`[THEME_SAVE] Normalized clientId: ${clientId} (source: ${clientIdSource})`);
 
-    // DEFENSIVE LAYER 4: Extract and validate color
-    const rawColor = body.color;
-    if (!rawColor || typeof rawColor !== "string") {
+    // DEFENSIVE LAYER 4: Extract and validate preset
+    const rawPreset = body.preset;
+    if (!rawPreset || typeof rawPreset !== "string" || rawPreset.trim().length === 0) {
       return res.status(400).json({
         ok: false,
-        reason: "INVALID_COLOR",
-        message: "color is required and must be a string"
+        reason: "INVALID_PRESET",
+        message: "preset is required and must be a non-empty string"
       });
     }
 
-    // Normalize color: trim and ensure uppercase
-    let color = String(rawColor).trim().toUpperCase();
-
-    // Validate HEX color format (#RRGGBB)
-    // Must start with # and have exactly 6 hex characters
-    const hexColorRegex = /^#[0-9A-F]{6}$/;
-    if (!hexColorRegex.test(color)) {
-      return res.status(400).json({
-        ok: false,
-        reason: "INVALID_COLOR",
-        message: "color must be a valid HEX color in format #RRGGBB (e.g., #22C55E)"
-      });
-    }
+    // Normalize preset: trim whitespace
+    const preset = String(rawPreset).trim();
 
     // Log theme save attempt
-    console.log(`[THEME_SAVE] Attempting to save theme: clientId=${clientId} (source: ${clientIdSource}), color=${color}`);
+    console.log(`[THEME_SAVE] Attempting to save theme: clientId=${clientId} (source: ${clientIdSource}), preset=${preset}`);
 
     // CRITICAL: Check if client exists BEFORE updating
     // Client MUST exist - never create implicitly during theme save
@@ -1610,14 +1599,14 @@ app.post("/client/theme", async (req, res) => {
       });
     }
 
-    // Client exists - update theme color using updateOne with upsert: false
+    // Client exists - update theme preset using updateOne with upsert: false
     // This ensures we NEVER create a client during theme save
     try {
       const updateResult = await Client.updateOne(
         { clientId: clientId },
         {
           $set: {
-            "theme.color": color
+            "theme.preset": preset
           }
         },
         { upsert: false } // CRITICAL: upsert: false - never create client here
@@ -1635,16 +1624,16 @@ app.post("/client/theme", async (req, res) => {
       }
 
       if (updateResult.modifiedCount === 1) {
-        console.log(`✅ [THEME_SAVE] Theme updated: clientId=${clientId}, color=${color} (update occurred)`);
+        console.log(`✅ [THEME_SAVE] Theme updated: clientId=${clientId}, preset=${preset} (update occurred)`);
       } else if (updateResult.modifiedCount === 0) {
-        console.log(`ℹ️  [THEME_SAVE] Theme unchanged: clientId=${clientId}, color=${color} (no update needed - color already set)`);
+        console.log(`ℹ️  [THEME_SAVE] Theme unchanged: clientId=${clientId}, preset=${preset} (no update needed - preset already set)`);
       }
 
       // Return success response
       return res.json({
         ok: true,
         message: "Theme updated",
-        color: color
+        preset: preset
       });
     } catch (dbError) {
       console.error(`❌ [THEME_SAVE] Database error updating theme (clientId=${clientId}):`, dbError);
@@ -1668,7 +1657,7 @@ app.post("/client/theme", async (req, res) => {
 
 /**
  * GET /client/:clientId
- * Fetches client theme color
+ * Fetches client theme preset
  * NEVER returns 404 - always returns a valid theme response
  * NEVER creates or modifies client - read-only operation
  * 
@@ -1677,29 +1666,32 @@ app.post("/client/theme", async (req, res) => {
  * 
  * Usage in Discord Bot:
  *   - Bot fetches client theme when creating menu
- *   - Always receives a valid color (default if missing)
+ *   - Always receives a valid preset (default if missing)
  *   - Menu creation never fails due to missing theme
  * 
  * Flow:
  * 1. Extracts clientId from URL parameter
  * 2. Looks up client in MongoDB by clientId (read-only)
- * 3. If client exists and has theme.color:
- *    - Returns client's theme color
- * 4. If client doesn't exist or has no theme:
- *    - Returns default theme color "#166534" (dark green)
- * 5. Always returns 200 status with valid response
+ * 3. If client exists and has theme.preset:
+ *    - Returns client's theme preset
+ * 4. If client exists but only has theme.color (legacy):
+ *    - Ignores color, returns default preset
+ * 5. If client doesn't exist or has no theme:
+ *    - Returns default theme preset "dark_green"
+ * 6. Always returns 200 status with valid response
  * 
  * CRITICAL RULES:
  * - NEVER creates or modifies client document
  * - Read-only operation
  * - Always returns valid response (never 404)
+ * - Prefers theme.preset over theme.color (backward compatibility)
  * 
  * Response format (ALWAYS 200):
  * {
  *   ok: true,
  *   clientId: string,
  *   theme: {
- *     color: "#166534" | client's color
+ *     preset: "dark_green" | client's preset
  *   }
  * }
  */
@@ -1718,19 +1710,19 @@ app.get("/client/:clientId", async (req, res) => {
     // Validate clientId is present
     if (!rawClientId || (typeof rawClientId === "string" && rawClientId.trim().length === 0)) {
       // Even if invalid, return default theme (never 404)
-      const defaultColor = "#166534";
-      console.log(`[THEME_FETCH] Invalid clientId provided (source: ${clientIdSource}), using default theme: ${defaultColor}`);
+      const defaultPreset = "dark_green";
+      console.log(`[THEME_FETCH] Invalid clientId provided (source: ${clientIdSource}), using default theme: ${defaultPreset}`);
       return res.status(200).json({
         ok: true,
         clientId: rawClientId || "",
         theme: {
-          color: defaultColor
+          preset: defaultPreset
         }
       });
     }
 
     const clientId = String(rawClientId).trim();
-    const defaultColor = "#166534"; // Default dark green theme
+    const defaultPreset = "dark_green"; // Default theme preset
     
     console.log(`[THEME_FETCH] Normalized clientId: ${clientId} (source: ${clientIdSource})`);
 
@@ -1750,22 +1742,27 @@ app.get("/client/:clientId", async (req, res) => {
       if (!client) {
         // Client doesn't exist - use default
         usedDefault = true;
-        console.log(`[THEME_FETCH] Client not found: clientId=${clientId} (source: ${clientIdSource}), using default theme: ${defaultColor} (read occurred, client not found)`);
-      } else if (!client.theme || !client.theme.color) {
-        // Client exists but has no theme - use default
+        console.log(`[THEME_FETCH] Client not found: clientId=${clientId} (source: ${clientIdSource}), using default theme: ${defaultPreset} (read occurred, client not found)`);
+      } else if (!client.theme || !client.theme.preset) {
+        // Client exists but has no preset
+        // Check if old theme.color exists (backward compatibility - ignore it)
+        if (client.theme && client.theme.color) {
+          console.log(`[THEME_FETCH] Client found with legacy theme.color (ignored): clientId=${clientId} (source: ${clientIdSource}), shop=${client.shop || "N/A"}, legacyColor=${client.theme.color}, using default preset: ${defaultPreset} (read occurred, preset missing, legacy color ignored)`);
+        } else {
+          console.log(`[THEME_FETCH] Client found but no theme preset set: clientId=${clientId} (source: ${clientIdSource}), shop=${client.shop || "N/A"}, using default theme: ${defaultPreset} (read occurred, theme missing)`);
+        }
         usedDefault = true;
-        console.log(`[THEME_FETCH] Client found but no theme set: clientId=${clientId} (source: ${clientIdSource}), shop=${client.shop || "N/A"}, using default theme: ${defaultColor} (read occurred, theme missing)`);
       } else {
-        // Client exists and has theme color
-        const clientColor = client.theme.color;
-        console.log(`[THEME_FETCH] Client theme found: clientId=${clientId} (source: ${clientIdSource}), shop=${client.shop || "N/A"}, color=${clientColor} (read occurred, theme returned)`);
+        // Client exists and has theme preset
+        const clientPreset = client.theme.preset;
+        console.log(`[THEME_FETCH] Client theme preset found: clientId=${clientId} (source: ${clientIdSource}), shop=${client.shop || "N/A"}, preset=${clientPreset} (read occurred, preset returned)`);
         
-        // Return client's theme color
+        // Return client's theme preset
         return res.status(200).json({
           ok: true,
           clientId: clientId,
           theme: {
-            color: clientColor
+            preset: clientPreset
           }
         });
       }
@@ -1777,12 +1774,12 @@ app.get("/client/:clientId", async (req, res) => {
     }
 
     // Return default theme (client not found or no theme set)
-    console.log(`[THEME_FETCH] Returning default theme: clientId=${clientId} (source: ${clientIdSource}), color=${defaultColor} (read occurred: ${readOccurred}, used default: ${usedDefault})`);
+    console.log(`[THEME_FETCH] Returning default theme: clientId=${clientId} (source: ${clientIdSource}), preset=${defaultPreset} (read occurred: ${readOccurred}, used default: ${usedDefault})`);
     return res.status(200).json({
       ok: true,
       clientId: clientId,
       theme: {
-        color: defaultColor
+        preset: defaultPreset
       }
     });
 
@@ -1790,12 +1787,12 @@ app.get("/client/:clientId", async (req, res) => {
     // FINAL CRASH-PROOF LAYER: Catch any unhandled errors
     // Even on error, return default theme (never 404)
     console.error("❌ [THEME_FETCH] Unhandled error in GET /client/:clientId:", error);
-    const defaultColor = "#166534";
+    const defaultPreset = "dark_green";
     return res.status(200).json({
       ok: true,
       clientId: req.params.clientId || "",
       theme: {
-        color: defaultColor
+        preset: defaultPreset
       }
     });
   }
