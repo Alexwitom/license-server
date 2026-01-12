@@ -837,13 +837,25 @@ app.post("/shopify/consume-order", async (req, res) => {
       });
     }
 
-    // DEFENSIVE LAYER 3: Extract and normalize clientId (TEMP FIX FOR TESTING)
-    const originalClientId = body.clientId;
-    const clientId = (body.clientId && String(body.clientId).trim()) ? String(body.clientId).trim() : "main";
+    // DEFENSIVE LAYER 3: Extract and normalize clientId (MULTI-TENANT SAFE - NO FALLBACKS)
+    // DO NOT override clientId - use EXACT value from request body
+    // DO NOT default to "main" - require explicit clientId for multi-tenant isolation
+    const rawClientId = body.clientId;
     
-    // TEMP DEBUG: Log clientId resolution
-    console.log("[DEBUG] Original clientId:", originalClientId || "(missing)");
-    console.log("[DEBUG] Resolved clientId:", clientId);
+    // Validate clientId is present and non-empty
+    if (!rawClientId || (typeof rawClientId === "string" && rawClientId.trim().length === 0)) {
+      return res.status(400).json({
+        ok: false,
+        reason: "INVALID_REQUEST",
+        message: "clientId is required"
+      });
+    }
+    
+    // Use EXACT clientId from request (trimmed for consistency, but no fallback)
+    const clientId = String(rawClientId).trim();
+    
+    // Debug log for claim flow
+    console.log("[CLAIM] clientId from request:", clientId);
 
     const rawOrderId = body.orderId;
     const rawEmail = body.email;
@@ -881,13 +893,16 @@ app.post("/shopify/consume-order", async (req, res) => {
     console.log("[DEBUG] Input type detected:", inputType);
 
     // Load client and Shopify credentials from MongoDB (multi-client architecture)
+    // Multi-tenant safe: Use EXACT clientId from request, no fallbacks
     let client;
     try {
       client = await getClientByClientId(clientId);
+      // Return explicit CLIENT_NOT_FOUND error if client doesn't exist
       if (!client || !client.shopify || !client.shopify.accessToken) {
         return res.status(404).json({
           ok: false,
-          reason: "STORE_NOT_FOUND"
+          reason: "CLIENT_NOT_FOUND",
+          message: `No Shopify store connected for clientId: ${clientId}`
         });
       }
       
