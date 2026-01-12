@@ -61,6 +61,14 @@ const ClientSchema = new mongoose.Schema({
   // ========== THEME FIELDS ==========
   // Client theme preferences
   theme: {
+    // Theme preset (e.g., "dark_green", "light_blue")
+    // This is the PRIMARY theme identifier - prefer this over color
+    preset: {
+      type: String,
+      default: null
+    },
+    // Legacy color field (kept for backward compatibility)
+    // If preset exists, ignore color
     color: {
       type: String,
       default: null
