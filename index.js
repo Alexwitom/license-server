@@ -619,6 +619,10 @@ app.post("/shopify/consume-order", async (req, res) => {
     
     // TEMP DEBUG: Log normalized order input
     console.log("[DEBUG] Normalized order input:", normalizedOrderId);
+    
+    // Detect input type: length > 10 = Shopify order ID, else = order_number
+    const inputType = normalizedOrderId.length > 10 ? "id" : "order_number";
+    console.log("[DEBUG] Input type detected:", inputType);
 
     // Load Shopify store credentials from MongoDB
     let store;
@@ -641,14 +645,11 @@ app.post("/shopify/consume-order", async (req, res) => {
       });
     }
 
-    // Helper function to fetch order from Shopify API
-    const fetchOrderFromShopify = (identifier, isOrderNumber = false) => {
+    // Helper function to fetch order by Shopify ID
+    const fetchOrderById = (orderId) => {
       return new Promise((resolve, reject) => {
         const apiVersion = process.env.SHOPIFY_API_VERSION || "2024-01";
-        // If searching by order_number, use query parameter; otherwise use path parameter
-        const apiPath = isOrderNumber
-          ? `/admin/api/${apiVersion}/orders.json?name=${encodeURIComponent(identifier)}`
-          : `/admin/api/${apiVersion}/orders/${identifier}.json`;
+        const apiPath = `/admin/api/${apiVersion}/orders/${orderId}.json`;
 
         const apiRequest = https.request(
           {
@@ -671,12 +672,7 @@ app.post("/shopify/consume-order", async (req, res) => {
               if (apiResponse.statusCode === 200) {
                 try {
                   const responseData = JSON.parse(data);
-                  // When searching by order_number, response is { orders: [...] }
-                  // When searching by ID, response is { order: {...} }
-                  const order = isOrderNumber
-                    ? (responseData.orders && responseData.orders.length > 0 ? responseData.orders[0] : null)
-                    : responseData.order;
-                  resolve(order);
+                  resolve(responseData.order);
                 } catch (parseError) {
                   reject(new Error(`Failed to parse response: ${parseError.message}`));
                 }
@@ -695,17 +691,74 @@ app.post("/shopify/consume-order", async (req, res) => {
 
         apiRequest.end();
       });
-  };
+    };
 
-    // Try to fetch order: first by ID, then by order_number if not found
+    // Helper function to fetch orders list and find by order_number
+    const fetchOrderByOrderNumber = (orderNumber) => {
+      return new Promise((resolve, reject) => {
+        const apiVersion = process.env.SHOPIFY_API_VERSION || "2024-01";
+        const apiPath = `/admin/api/${apiVersion}/orders.json?status=any&limit=50`;
+
+        const apiRequest = https.request(
+          {
+            hostname: store.shop,
+            path: apiPath,
+            method: "GET",
+            headers: {
+              "X-Shopify-Access-Token": store.accessToken,
+              "Content-Type": "application/json"
+            }
+          },
+          (apiResponse) => {
+            let data = "";
+
+            apiResponse.on("data", (chunk) => {
+              data += chunk;
+            });
+
+            apiResponse.on("end", () => {
+              if (apiResponse.statusCode === 200) {
+                try {
+                  const responseData = JSON.parse(data);
+                  const orders = responseData.orders || [];
+                  
+                  // TEMP DEBUG: Log total orders scanned
+                  console.log("[DEBUG] Total orders scanned:", orders.length);
+                  
+                  // Find order where order.order_number matches the input (as number)
+                  const targetOrderNumber = Number(orderNumber);
+                  const foundOrder = orders.find(order => {
+                    return order.order_number === targetOrderNumber;
+                  });
+                  
+                  resolve(foundOrder || null);
+                } catch (parseError) {
+                  reject(new Error(`Failed to parse response: ${parseError.message}`));
+                }
+              } else {
+                reject(new Error(`API error ${apiResponse.statusCode}: ${data}`));
+              }
+            });
+          }
+        );
+
+        apiRequest.on("error", (err) => {
+          reject(err);
+        });
+
+        apiRequest.end();
+      });
+    };
+
+    // Fetch order based on input type
     let order = null;
     try {
-      // First attempt: try as numeric ID
-      order = await fetchOrderFromShopify(normalizedOrderId, false);
-      
-      // If not found, try by order_number
-      if (!order) {
-        order = await fetchOrderFromShopify(normalizedOrderId, true);
+      if (inputType === "id") {
+        // Fetch directly by Shopify order ID
+        order = await fetchOrderById(normalizedOrderId);
+      } else {
+        // Fetch recent orders and find by order_number
+        order = await fetchOrderByOrderNumber(normalizedOrderId);
       }
     } catch (fetchError) {
       console.error("❌ Error fetching order from Shopify:", fetchError);
@@ -723,7 +776,8 @@ app.post("/shopify/consume-order", async (req, res) => {
       });
     }
 
-    // Extract the real Shopify order ID from the order object
+    // Extract the REAL Shopify order ID from the order object
+    // IMPORTANT: Use ONLY this real ID for email comparison, consumed-order lookup, and reuse limits
     const verifiedOrderId = String(order.id);
     
     // TEMP DEBUG: Log resolved Shopify order ID
