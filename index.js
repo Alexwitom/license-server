@@ -260,9 +260,16 @@ app.post("/admin/generate", async (req, res) => {
 app.get("/shopify/auth", (req, res) => {
   const { clientId, shop } = req.query;
 
+  // CRITICAL: clientId MUST come from Electron app (query parameter)
+  // NEVER use environment variables or bot config
+  const clientIdSource = "query_param";
+  
+  // Log clientId source immediately
+  console.log(`[OAUTH_AUTH] clientId received from ${clientIdSource}: ${clientId || "(missing)"}`);
+
   // Validate required parameters
   if (!clientId) {
-    console.error("❌ OAuth started: Missing clientId parameter");
+    console.error(`❌ [OAUTH_AUTH] Missing clientId parameter (source: ${clientIdSource})`);
     return res.status(400).json({
       ok: false,
       reason: "BAD_REQUEST",
@@ -271,7 +278,7 @@ app.get("/shopify/auth", (req, res) => {
   }
 
   if (!shop) {
-    console.error(`❌ OAuth started: Missing shop parameter for clientId: ${clientId}`);
+    console.error(`❌ [OAUTH_AUTH] Missing shop parameter for clientId: ${clientId} (source: ${clientIdSource})`);
     return res.status(400).json({
       ok: false,
       reason: "BAD_REQUEST",
@@ -281,7 +288,7 @@ app.get("/shopify/auth", (req, res) => {
 
   // Validate clientId format (non-empty string)
   if (typeof clientId !== "string" || clientId.trim().length === 0) {
-    console.error(`❌ OAuth started: Invalid clientId format: ${clientId}`);
+    console.error(`❌ [OAUTH_AUTH] Invalid clientId format: ${clientId} (source: ${clientIdSource})`);
     return res.status(400).json({
       ok: false,
       reason: "INVALID_CLIENT_ID",
@@ -289,9 +296,13 @@ app.get("/shopify/auth", (req, res) => {
     });
   }
 
+  // Normalize clientId (trim only, no fallbacks)
+  const normalizedClientId = String(clientId).trim();
+  console.log(`[OAUTH_AUTH] Normalized clientId: ${normalizedClientId} (source: ${clientIdSource})`);
+
   // Validate shop domain format
   if (!shop.includes(".myshopify.com")) {
-    console.error(`❌ OAuth started: Invalid shop format for clientId: ${clientId}, shop: ${shop}`);
+    console.error(`❌ [OAUTH_AUTH] Invalid shop format for clientId: ${normalizedClientId}, shop: ${shop} (source: ${clientIdSource})`);
     return res.status(400).json({
       ok: false,
       reason: "INVALID_SHOP",
@@ -305,7 +316,7 @@ app.get("/shopify/auth", (req, res) => {
   const redirectUri = process.env.SHOPIFY_REDIRECT_URI || `${process.env.SERVER_BASE_URL}/shopify/callback`;
 
   if (!apiKey) {
-    console.error("❌ OAuth started: SHOPIFY_API_KEY not set in environment");
+    console.error("❌ [OAUTH_AUTH] SHOPIFY_API_KEY not set in environment");
     return res.status(500).json({
       ok: false,
       reason: "SERVER_ERROR",
@@ -313,12 +324,12 @@ app.get("/shopify/auth", (req, res) => {
     });
   }
 
-  // Log OAuth initiation
-  console.log(`🔐 OAuth started: clientId=${clientId}, shop=${shop}`);
+  // Log OAuth initiation with source
+  console.log(`🔐 [OAUTH_AUTH] OAuth started: clientId=${normalizedClientId} (source: ${clientIdSource}), shop=${shop}`);
 
-  // Create state token: base64 encode clientId + random nonce for security
+  // Create state token: base64 encode normalizedClientId + random nonce for security
   const nonce = crypto.randomBytes(16).toString("hex");
-  const state = Buffer.from(JSON.stringify({ clientId, nonce })).toString("base64");
+  const state = Buffer.from(JSON.stringify({ clientId: normalizedClientId, nonce })).toString("base64");
 
   // Build Shopify OAuth authorization URL
   const authUrl = `https://${shop}/admin/oauth/authorize?${querystring.stringify({
@@ -487,8 +498,9 @@ app.get("/shopify/callback", async (req, res) => {
     console.warn(`⚠️  OAuth callback: ${hmacValidation.message} - proceeding without HMAC validation`);
   }
 
-  // CRITICAL: clientId MUST come from Electron/Discord, NEVER from shop name
+  // CRITICAL: clientId MUST come from Electron/Discord, NEVER from shop name or environment
   // Priority: 1) query param clientId, 2) state token clientId
+  // NEVER use process.env.CLIENT_ID or bot config
   let clientId;
   let clientIdSource = "unknown";
 
@@ -496,7 +508,7 @@ app.get("/shopify/callback", async (req, res) => {
   if (queryClientId && typeof queryClientId === "string" && queryClientId.trim().length > 0) {
     clientId = String(queryClientId).trim();
     clientIdSource = "query_param";
-    console.log(`[OAUTH] clientId from query parameter: ${clientId}`);
+    console.log(`[OAUTH_CALLBACK] clientId received from ${clientIdSource}: ${clientId}`);
   } else if (state) {
     // Fallback: try to get clientId from state token
     try {
@@ -505,27 +517,27 @@ app.get("/shopify/callback", async (req, res) => {
       if (stateClientId && typeof stateClientId === "string" && stateClientId.trim().length > 0) {
         clientId = String(stateClientId).trim();
         clientIdSource = "state_token";
-        console.log(`[OAUTH] clientId from state token: ${clientId}`);
+        console.log(`[OAUTH_CALLBACK] clientId received from ${clientIdSource}: ${clientId}`);
       }
     } catch (err) {
-      console.warn(`⚠️  OAuth callback: Failed to decode state token: ${err.message}`);
+      console.warn(`⚠️  [OAUTH_CALLBACK] Failed to decode state token: ${err.message}`);
     }
   }
 
   // Validate clientId was found
   if (!clientId || clientId.trim().length === 0) {
-    console.error("❌ OAuth callback: clientId is required (must come from Electron/Discord, not shop name)");
+    console.error(`❌ [OAUTH_CALLBACK] clientId is required (must come from Electron/Discord, not shop name or environment). Source: ${clientIdSource}`);
     return res.status(400).json({
       ok: false,
       reason: "MISSING_CLIENT_ID",
-      message: "clientId query parameter is required. clientId must come from Electron/Discord, never from shop name."
+      message: "clientId query parameter is required. clientId must come from Electron/Discord, never from shop name or environment."
     });
   }
 
   // CRITICAL: NEVER use shop name as clientId
   // Validate that clientId is not the shop name
   if (clientId === shop || clientId.includes(".myshopify.com")) {
-    console.error(`❌ OAuth callback: Invalid clientId - cannot use shop name as clientId. clientId=${clientId}, shop=${shop}`);
+    console.error(`❌ [OAUTH_CALLBACK] Invalid clientId - cannot use shop name as clientId. clientId=${clientId}, shop=${shop} (source: ${clientIdSource})`);
     return res.status(400).json({
       ok: false,
       reason: "INVALID_CLIENT_ID",
@@ -533,7 +545,7 @@ app.get("/shopify/callback", async (req, res) => {
     });
   }
 
-  console.log(`🔐 OAuth callback: Processing for clientId=${clientId} (source: ${clientIdSource}), shop=${shop}`);
+  console.log(`🔐 [OAUTH_CALLBACK] Processing OAuth: clientId=${clientId} (source: ${clientIdSource}), shop=${shop}`);
 
   // Exchange authorization code for access token
   const tokenRequestData = querystring.stringify({
@@ -592,17 +604,25 @@ app.get("/shopify/callback", async (req, res) => {
             // Update or create Client document in MongoDB
             // CRITICAL: clientId is PRIMARY KEY - NEVER generate or overwrite it
             // CRITICAL: shop name is a FIELD, not an identifier
+            // CRITICAL: clientId MUST come from Electron/Discord request, NEVER from environment
             try {
               // Check if client already exists (for logging purposes)
               const existingClient = await Client.findOne({ clientId });
               const isNewClient = !existingClient;
+              
+              // Log whether existing client was found
+              if (existingClient) {
+                console.log(`[OAUTH_CALLBACK] Existing client found: clientId=${clientId} (source: ${clientIdSource}), shop=${existingClient.shop || "N/A"}`);
+              } else {
+                console.log(`[OAUTH_CALLBACK] No existing client found: clientId=${clientId} (source: ${clientIdSource}) - will create new client`);
+              }
 
               // Check for duplicate clients with same shop (warn only, don't delete)
               const duplicateClients = await Client.find({ shop: shop });
               if (duplicateClients.length > 1 || (duplicateClients.length === 1 && duplicateClients[0].clientId !== clientId)) {
                 const duplicateClientIds = duplicateClients.map(c => c.clientId).filter(id => id !== clientId);
                 if (duplicateClientIds.length > 0) {
-                  console.warn(`⚠️  [OAUTH] WARNING: Multiple clients found for shop=${shop}. Other clientIds: ${duplicateClientIds.join(", ")}. Current clientId: ${clientId}`);
+                  console.warn(`⚠️  [OAUTH_CALLBACK] WARNING: Multiple clients found for shop=${shop}. Other clientIds: ${duplicateClientIds.join(", ")}. Current clientId: ${clientId} (source: ${clientIdSource})`);
                 }
               }
 
@@ -624,12 +644,12 @@ app.get("/shopify/callback", async (req, res) => {
               );
 
               if (isNewClient) {
-                console.log(`[OAUTH] Client created: clientId=${clientId}, shop=${shop}, platform=shopify`);
+                console.log(`[OAUTH_CALLBACK] Client created: clientId=${clientId} (source: ${clientIdSource}), shop=${shop}, platform=shopify`);
               } else {
-                console.log(`[OAUTH] Client updated: clientId=${clientId}, shop=${shop}, platform=shopify`);
+                console.log(`[OAUTH_CALLBACK] Client updated: clientId=${clientId} (source: ${clientIdSource}), shop=${shop}, platform=shopify`);
               }
 
-              console.log(`✅ OAuth success: clientId=${clientId}, shop=${shop}, created=${isNewClient}`);
+              console.log(`✅ [OAUTH_CALLBACK] OAuth success: clientId=${clientId} (source: ${clientIdSource}), shop=${shop}, created=${isNewClient}, existingClientFound=${!isNewClient}`);
 
               // Return success response
               res.json({
@@ -831,8 +851,16 @@ async function fetchWooCommerceOrderById(storeUrl, consumerKey, consumerSecret, 
 app.get("/shopify/verify-order", async (req, res) => {
   const { clientId, email } = req.query;
 
+  // CRITICAL: clientId MUST come from Electron/Discord request (query parameter)
+  // NEVER use environment variables or bot config
+  const clientIdSource = "query_param";
+  
+  // Log clientId source immediately
+  console.log(`[VERIFY_ORDER] clientId received from ${clientIdSource}: ${clientId || "(missing)"}`);
+
   // Validate required query parameters
   if (!clientId || !email) {
+    console.error(`❌ [VERIFY_ORDER] Missing required parameters: clientId=${clientId || "(missing)"}, email=${email || "(missing)"} (source: ${clientIdSource})`);
     return res.status(400).json({
       ok: false,
       reason: "BAD_REQUEST",
@@ -840,20 +868,27 @@ app.get("/shopify/verify-order", async (req, res) => {
     });
   }
 
+  // Normalize clientId (trim only, no fallbacks)
+  const normalizedClientId = String(clientId).trim();
+  console.log(`[VERIFY_ORDER] Normalized clientId: ${normalizedClientId} (source: ${clientIdSource})`);
+
   // Load client and platform credentials from MongoDB (multi-client architecture)
   // clientId is PRIMARY KEY - lookup is strict and isolated per client
+  // NEVER use process.env.CLIENT_ID or bot config
   let client;
   try {
-    client = await getClientByClientId(clientId);
+    client = await getClientByClientId(normalizedClientId);
     if (!client) {
+      console.log(`[VERIFY_ORDER] Client NOT found: clientId=${normalizedClientId} (source: ${clientIdSource})`);
       return res.status(404).json({
         ok: false,
         reason: "CLIENT_NOT_FOUND",
         message: "No store connected for this clientId"
       });
     }
+    console.log(`[VERIFY_ORDER] Client found: clientId=${normalizedClientId} (source: ${clientIdSource}), shop=${client.shop || "N/A"}, platform=${client.platform || "shopify"}`);
   } catch (dbError) {
-    console.error(`❌ Database error loading client (clientId=${clientId}):`, dbError);
+    console.error(`❌ [VERIFY_ORDER] Database error loading client (clientId=${normalizedClientId}, source: ${clientIdSource}):`, dbError);
     return res.status(500).json({
       ok: false,
       reason: "DB_ERROR",
@@ -1067,12 +1102,19 @@ app.post("/shopify/consume-order", async (req, res) => {
     }
 
     // DEFENSIVE LAYER 3: Extract and normalize clientId (MULTI-TENANT SAFE - NO FALLBACKS)
+    // CRITICAL: clientId MUST come from Electron/Discord request (body parameter)
+    // NEVER use process.env.CLIENT_ID or bot config
     // DO NOT override clientId - use EXACT value from request body
     // DO NOT default to "main" - require explicit clientId for multi-tenant isolation
+    const clientIdSource = "body_param";
     const rawClientId = body.clientId;
+    
+    // Log clientId source immediately
+    console.log(`[CONSUME_ORDER] clientId received from ${clientIdSource}: ${rawClientId || "(missing)"}`);
     
     // Validate clientId is present and non-empty
     if (!rawClientId || (typeof rawClientId === "string" && rawClientId.trim().length === 0)) {
+      console.error(`❌ [CONSUME_ORDER] Missing or empty clientId (source: ${clientIdSource})`);
       return res.status(400).json({
         ok: false,
         reason: "INVALID_REQUEST",
@@ -1082,9 +1124,7 @@ app.post("/shopify/consume-order", async (req, res) => {
     
     // Use EXACT clientId from request (trimmed for consistency, but no fallback)
     const clientId = String(rawClientId).trim();
-    
-    // Debug log for claim flow
-    console.log("[CLAIM] clientId from request:", clientId);
+    console.log(`[CONSUME_ORDER] Normalized clientId: ${clientId} (source: ${clientIdSource})`);
 
     const rawOrderId = body.orderId;
     const rawEmail = body.email;
@@ -1124,19 +1164,21 @@ app.post("/shopify/consume-order", async (req, res) => {
     // Load client and platform credentials from MongoDB (multi-client architecture)
     // clientId is PRIMARY KEY - lookup is strict and isolated per client
     // Multi-tenant safe: Use EXACT clientId from request, no fallbacks
+    // NEVER use process.env.CLIENT_ID or bot config
     let client;
     try {
       client = await getClientByClientId(clientId);
       if (!client) {
-        console.log(`[CLAIM] Client NOT found: clientId=${clientId}`);
+        console.log(`[CONSUME_ORDER] Client NOT found: clientId=${clientId} (source: ${clientIdSource})`);
         return res.status(404).json({
           ok: false,
           reason: "CLIENT_NOT_FOUND",
           message: `No store connected for clientId: ${clientId}`
         });
       }
+      console.log(`[CONSUME_ORDER] Client found: clientId=${clientId} (source: ${clientIdSource}), shop=${client.shop || "N/A"}, platform=${client.platform || "shopify"}`);
     } catch (dbError) {
-      console.error(`❌ Database error loading client (clientId=${clientId}):`, dbError);
+      console.error(`❌ [CONSUME_ORDER] Database error loading client (clientId=${clientId}, source: ${clientIdSource}):`, dbError);
       return res.status(500).json({
         ok: false,
         reason: "INTERNAL_ERROR"
@@ -1492,8 +1534,16 @@ app.post("/client/theme", async (req, res) => {
     }
 
     // DEFENSIVE LAYER 3: Extract and validate clientId
+    // CRITICAL: clientId MUST come from Electron/Discord request (body parameter)
+    // NEVER use process.env.CLIENT_ID or bot config
+    const clientIdSource = "body_param";
     const rawClientId = body.clientId;
+    
+    // Log clientId source immediately
+    console.log(`[THEME_SAVE] clientId received from ${clientIdSource}: ${rawClientId || "(missing)"}`);
+    
     if (!rawClientId || (typeof rawClientId === "string" && rawClientId.trim().length === 0)) {
+      console.error(`❌ [THEME_SAVE] Missing or empty clientId (source: ${clientIdSource})`);
       return res.status(400).json({
         ok: false,
         reason: "INVALID_REQUEST",
@@ -1501,6 +1551,7 @@ app.post("/client/theme", async (req, res) => {
       });
     }
     const clientId = String(rawClientId).trim();
+    console.log(`[THEME_SAVE] Normalized clientId: ${clientId} (source: ${clientIdSource})`);
 
     // DEFENSIVE LAYER 4: Extract and validate color
     const rawColor = body.color;
@@ -1527,15 +1578,21 @@ app.post("/client/theme", async (req, res) => {
     }
 
     // Log theme save attempt
-    console.log(`[THEME_SAVE] Attempting to save theme: clientId=${clientId}, color=${color}`);
+    console.log(`[THEME_SAVE] Attempting to save theme: clientId=${clientId} (source: ${clientIdSource}), color=${color}`);
 
     // CRITICAL: Check if client exists BEFORE updating
     // Client MUST exist - never create implicitly during theme save
+    // NEVER use process.env.CLIENT_ID or bot config
     let existingClient;
     try {
       existingClient = await Client.findOne({ clientId: clientId });
+      if (existingClient) {
+        console.log(`[THEME_SAVE] Existing client found: clientId=${clientId} (source: ${clientIdSource}), shop=${existingClient.shop || "N/A"}`);
+      } else {
+        console.log(`[THEME_SAVE] No existing client found: clientId=${clientId} (source: ${clientIdSource})`);
+      }
     } catch (dbError) {
-      console.error(`❌ [THEME_SAVE] Database error checking client existence (clientId=${clientId}):`, dbError);
+      console.error(`❌ [THEME_SAVE] Database error checking client existence (clientId=${clientId}, source: ${clientIdSource}):`, dbError);
       return res.status(500).json({
         ok: false,
         reason: "INTERNAL_ERROR",
@@ -1545,7 +1602,7 @@ app.post("/client/theme", async (req, res) => {
 
     // If client doesn't exist, return error (DO NOT create)
     if (!existingClient) {
-      console.warn(`⚠️  [THEME_SAVE] WARNING: Theme save attempted for non-existing client: clientId=${clientId}`);
+      console.warn(`⚠️  [THEME_SAVE] WARNING: Theme save attempted for non-existing client: clientId=${clientId} (source: ${clientIdSource})`);
       return res.status(404).json({
         ok: false,
         reason: "CLIENT_NOT_FOUND",
@@ -1648,14 +1705,21 @@ app.post("/client/theme", async (req, res) => {
  */
 app.get("/client/:clientId", async (req, res) => {
   try {
+    // CRITICAL: clientId MUST come from Electron/Discord request (URL parameter)
+    // NEVER use process.env.CLIENT_ID or bot config
+    const clientIdSource = "url_param";
+    
     // Extract clientId from URL parameter
     const rawClientId = req.params.clientId;
+    
+    // Log clientId source immediately
+    console.log(`[THEME_FETCH] clientId received from ${clientIdSource}: ${rawClientId || "(missing)"}`);
     
     // Validate clientId is present
     if (!rawClientId || (typeof rawClientId === "string" && rawClientId.trim().length === 0)) {
       // Even if invalid, return default theme (never 404)
       const defaultColor = "#166534";
-      console.log(`[THEME_FETCH] Invalid clientId provided, using default theme: ${defaultColor}`);
+      console.log(`[THEME_FETCH] Invalid clientId provided (source: ${clientIdSource}), using default theme: ${defaultColor}`);
       return res.status(200).json({
         ok: true,
         clientId: rawClientId || "",
@@ -1667,11 +1731,14 @@ app.get("/client/:clientId", async (req, res) => {
 
     const clientId = String(rawClientId).trim();
     const defaultColor = "#166534"; // Default dark green theme
+    
+    console.log(`[THEME_FETCH] Normalized clientId: ${clientId} (source: ${clientIdSource})`);
 
     // Log theme fetch attempt
-    console.log(`[THEME_FETCH] Fetching theme: clientId=${clientId}`);
+    console.log(`[THEME_FETCH] Fetching theme: clientId=${clientId} (source: ${clientIdSource})`);
 
     // Look up client in MongoDB (read-only - never create or modify)
+    // NEVER use process.env.CLIENT_ID or bot config
     let client;
     let usedDefault = false;
     let readOccurred = false;
@@ -1683,15 +1750,15 @@ app.get("/client/:clientId", async (req, res) => {
       if (!client) {
         // Client doesn't exist - use default
         usedDefault = true;
-        console.log(`[THEME_FETCH] Client not found: clientId=${clientId}, using default theme: ${defaultColor} (read occurred, client not found)`);
+        console.log(`[THEME_FETCH] Client not found: clientId=${clientId} (source: ${clientIdSource}), using default theme: ${defaultColor} (read occurred, client not found)`);
       } else if (!client.theme || !client.theme.color) {
         // Client exists but has no theme - use default
         usedDefault = true;
-        console.log(`[THEME_FETCH] Client found but no theme set: clientId=${clientId}, using default theme: ${defaultColor} (read occurred, theme missing)`);
+        console.log(`[THEME_FETCH] Client found but no theme set: clientId=${clientId} (source: ${clientIdSource}), shop=${client.shop || "N/A"}, using default theme: ${defaultColor} (read occurred, theme missing)`);
       } else {
         // Client exists and has theme color
         const clientColor = client.theme.color;
-        console.log(`[THEME_FETCH] Client theme found: clientId=${clientId}, color=${clientColor} (read occurred, theme returned)`);
+        console.log(`[THEME_FETCH] Client theme found: clientId=${clientId} (source: ${clientIdSource}), shop=${client.shop || "N/A"}, color=${clientColor} (read occurred, theme returned)`);
         
         // Return client's theme color
         return res.status(200).json({
@@ -1704,13 +1771,13 @@ app.get("/client/:clientId", async (req, res) => {
       }
     } catch (dbError) {
       // Database error - use default (never 404)
-      console.error(`❌ [THEME_FETCH] Database error fetching client theme (clientId=${clientId}):`, dbError);
+      console.error(`❌ [THEME_FETCH] Database error fetching client theme (clientId=${clientId}, source: ${clientIdSource}):`, dbError);
       usedDefault = true;
       readOccurred = false; // Read failed
     }
 
     // Return default theme (client not found or no theme set)
-    console.log(`[THEME_FETCH] Returning default theme: clientId=${clientId}, color=${defaultColor} (read occurred: ${readOccurred}, used default: ${usedDefault})`);
+    console.log(`[THEME_FETCH] Returning default theme: clientId=${clientId} (source: ${clientIdSource}), color=${defaultColor} (read occurred: ${readOccurred}, used default: ${usedDefault})`);
     return res.status(200).json({
       ok: true,
       clientId: clientId,
