@@ -446,15 +446,15 @@ function fetchShopInfo(shop, accessToken) {
  *   - App receives success response and can update UI
  */
 app.get("/shopify/callback", async (req, res) => {
-  const { code, state, shop, hmac } = req.query;
+  const { code, state, shop, hmac, clientId: queryClientId } = req.query;
 
   // Validate required parameters
-  if (!code || !state || !shop) {
+  if (!code || !shop) {
     console.error("❌ OAuth callback: Missing required parameters");
     return res.status(400).json({
       ok: false,
       reason: "BAD_REQUEST",
-      message: "code, state, and shop query parameters are required"
+      message: "code and shop query parameters are required"
     });
   }
 
@@ -487,25 +487,53 @@ app.get("/shopify/callback", async (req, res) => {
     console.warn(`⚠️  OAuth callback: ${hmacValidation.message} - proceeding without HMAC validation`);
   }
 
-  // Decode state to get clientId
+  // CRITICAL: clientId MUST come from Electron/Discord, NEVER from shop name
+  // Priority: 1) query param clientId, 2) state token clientId
   let clientId;
-  try {
-    const stateData = JSON.parse(Buffer.from(state, "base64").toString());
-    clientId = stateData.clientId;
-    if (!clientId || typeof clientId !== "string" || clientId.trim().length === 0) {
-      throw new Error("clientId missing or invalid in state");
+  let clientIdSource = "unknown";
+
+  // Try to get clientId from query parameter first (preferred - from Electron/Discord)
+  if (queryClientId && typeof queryClientId === "string" && queryClientId.trim().length > 0) {
+    clientId = String(queryClientId).trim();
+    clientIdSource = "query_param";
+    console.log(`[OAUTH] clientId from query parameter: ${clientId}`);
+  } else if (state) {
+    // Fallback: try to get clientId from state token
+    try {
+      const stateData = JSON.parse(Buffer.from(state, "base64").toString());
+      const stateClientId = stateData.clientId;
+      if (stateClientId && typeof stateClientId === "string" && stateClientId.trim().length > 0) {
+        clientId = String(stateClientId).trim();
+        clientIdSource = "state_token";
+        console.log(`[OAUTH] clientId from state token: ${clientId}`);
+      }
+    } catch (err) {
+      console.warn(`⚠️  OAuth callback: Failed to decode state token: ${err.message}`);
     }
-    clientId = clientId.trim();
-  } catch (err) {
-    console.error("❌ OAuth callback: Invalid state token:", err);
+  }
+
+  // Validate clientId was found
+  if (!clientId || clientId.trim().length === 0) {
+    console.error("❌ OAuth callback: clientId is required (must come from Electron/Discord, not shop name)");
     return res.status(400).json({
       ok: false,
-      reason: "INVALID_STATE",
-      message: "Invalid or corrupted state parameter"
+      reason: "MISSING_CLIENT_ID",
+      message: "clientId query parameter is required. clientId must come from Electron/Discord, never from shop name."
     });
   }
 
-  console.log(`🔐 OAuth callback: Processing for clientId=${clientId}, shop=${shop}`);
+  // CRITICAL: NEVER use shop name as clientId
+  // Validate that clientId is not the shop name
+  if (clientId === shop || clientId.includes(".myshopify.com")) {
+    console.error(`❌ OAuth callback: Invalid clientId - cannot use shop name as clientId. clientId=${clientId}, shop=${shop}`);
+    return res.status(400).json({
+      ok: false,
+      reason: "INVALID_CLIENT_ID",
+      message: "clientId cannot be the shop name. clientId must come from Electron/Discord."
+    });
+  }
+
+  console.log(`🔐 OAuth callback: Processing for clientId=${clientId} (source: ${clientIdSource}), shop=${shop}`);
 
   // Exchange authorization code for access token
   const tokenRequestData = querystring.stringify({
@@ -561,32 +589,47 @@ app.get("/shopify/callback", async (req, res) => {
               console.warn(`⚠️  OAuth callback: Failed to fetch shop info for clientId=${clientId}, continuing anyway`);
             }
 
-            // Auto-create or update Client document in MongoDB
-            // IMPORTANT: clientId is PRIMARY KEY - NEVER generate or overwrite it
+            // Update or create Client document in MongoDB
+            // CRITICAL: clientId is PRIMARY KEY - NEVER generate or overwrite it
+            // CRITICAL: shop name is a FIELD, not an identifier
             try {
-              // Check if client exists (lookup by PRIMARY KEY: clientId)
-              let client = await Client.findOne({ clientId });
+              // Check if client already exists (for logging purposes)
+              const existingClient = await Client.findOne({ clientId });
+              const isNewClient = !existingClient;
 
-              if (!client) {
-                // Auto-create new client document
-                // NEVER generate clientId - use the one from OAuth state
-                client = await Client.create({
-                  clientId, // PRIMARY KEY - from OAuth state, never generated
-                  shop,
-                  shopifyAccessToken: access_token,
-                  createdAt: new Date()
-                });
-                console.log(`[OAUTH] Client created: clientId=${clientId}, shop=${shop}`);
-              } else {
-                // Update existing client's Shopify connection
-                // NEVER overwrite clientId - it's the PRIMARY KEY
-                client.shop = shop;
-                client.shopifyAccessToken = access_token;
-                await client.save();
-                console.log(`[OAUTH] Client updated: clientId=${clientId}, shop=${shop}`);
+              // Check for duplicate clients with same shop (warn only, don't delete)
+              const duplicateClients = await Client.find({ shop: shop });
+              if (duplicateClients.length > 1 || (duplicateClients.length === 1 && duplicateClients[0].clientId !== clientId)) {
+                const duplicateClientIds = duplicateClients.map(c => c.clientId).filter(id => id !== clientId);
+                if (duplicateClientIds.length > 0) {
+                  console.warn(`⚠️  [OAUTH] WARNING: Multiple clients found for shop=${shop}. Other clientIds: ${duplicateClientIds.join(", ")}. Current clientId: ${clientId}`);
+                }
               }
 
-              console.log(`✅ OAuth success: clientId=${clientId}, shop=${shop}`);
+              // Use updateOne with upsert to update existing client or create new one
+              // This ensures: one clientId = one Mongo document
+              const updateResult = await Client.updateOne(
+                { clientId: clientId },
+                {
+                  $set: {
+                    platform: "shopify",
+                    shop: shop,
+                    shopifyAccessToken: access_token
+                  }
+                },
+                {
+                  upsert: true,
+                  setDefaultsOnInsert: true
+                }
+              );
+
+              if (isNewClient) {
+                console.log(`[OAUTH] Client created: clientId=${clientId}, shop=${shop}, platform=shopify`);
+              } else {
+                console.log(`[OAUTH] Client updated: clientId=${clientId}, shop=${shop}, platform=shopify`);
+              }
+
+              console.log(`✅ OAuth success: clientId=${clientId}, shop=${shop}, created=${isNewClient}`);
 
               // Return success response
               res.json({
