@@ -6,26 +6,30 @@ const querystring = require("querystring");
 
 const app = express();
 
-// Configure JSON body parser with error handling to prevent crashes on malformed JSON
-app.use(express.json({
-  strict: true, // Only parse arrays and objects
-  limit: '10mb' // Prevent abuse
-}));
+// Configure body parsers
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Error handler for JSON parsing errors
-// Catches SyntaxError thrown by express.json() when malformed JSON is sent
-app.use((err, req, res, next) => {
-  // Express JSON parser throws SyntaxError with status 400 when JSON is malformed
-  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
-    console.error("❌ JSON parsing error:", err.message);
+// Safe JSON guard middleware: reject non-JSON requests before routes
+app.use((req, res, next) => {
+  // Debug log Content-Type
+  console.log("[DEBUG] Content-Type:", req.headers["content-type"]);
+  
+  // Skip Content-Type check for GET requests (no body expected)
+  if (req.method === "GET" || req.method === "HEAD") {
+    return next();
+  }
+  
+  // For requests with body, require application/json Content-Type
+  const contentType = req.headers["content-type"] || "";
+  if (!contentType.includes("application/json")) {
     return res.status(400).json({
       ok: false,
-      reason: "INVALID_JSON",
-      message: "Request body contains invalid JSON"
+      reason: "INVALID_CONTENT_TYPE"
     });
   }
-  // Pass other errors to default error handler
-  next(err);
+  
+  next();
 });
 
 /* ================= MONGO ================= */
