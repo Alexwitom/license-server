@@ -6,10 +6,30 @@ const querystring = require("querystring");
 
 const app = express();
 
+// Content-Type guard middleware: ensure POST requests have valid Content-Type (BEFORE body parsers)
+app.use((req, res, next) => {
+  // Skip check for GET/HEAD requests (no body expected)
+  if (req.method === "GET" || req.method === "HEAD") {
+    return next();
+  }
+  
+  // For POST/PUT/PATCH, require application/json Content-Type
+  const contentType = req.headers["content-type"] || "";
+  if (!contentType.includes("application/json")) {
+    return res.status(400).json({
+      ok: false,
+      reason: "INVALID_CONTENT_TYPE",
+      message: "Content-Type must be application/json"
+    });
+  }
+  
+  next();
+});
+
 // Configure body parsers - accept multiple content types for crash-proof parsing
 app.use(express.json({ strict: false, limit: "1mb" })); // Accept malformed JSON
-app.use(express.text({ type: "*/*", limit: "1mb" })); // Accept text/plain and any other type
-app.use(express.urlencoded({ extended: true, limit: "1mb" }));
+app.use(express.text({ type: "*/*", limit: "1mb" })); // Accept text/plain and any other type (fallback)
+app.use(express.urlencoded({ extended: true, limit: "1mb" })); // Accept URL-encoded (fallback)
 
 /* ================= MONGO ================= */
 
@@ -561,8 +581,14 @@ app.post("/shopify/consume-order", async (req, res) => {
       });
     }
 
-    // DEFENSIVE LAYER 3: Normalize and extract input fields safely
-    const clientId = body.clientId ? String(body.clientId).trim() || "main" : "main";
+    // DEFENSIVE LAYER 3: Extract and normalize clientId (TEMP FIX FOR TESTING)
+    const originalClientId = body.clientId;
+    const clientId = (body.clientId && String(body.clientId).trim()) ? String(body.clientId).trim() : "main";
+    
+    // TEMP DEBUG: Log clientId resolution
+    console.log("[DEBUG] Original clientId:", originalClientId || "(missing)");
+    console.log("[DEBUG] Resolved clientId:", clientId);
+
     const rawOrderId = body.orderId;
     const rawEmail = body.email;
     const rawDiscordUserId = body.discordUserId;
@@ -576,16 +602,23 @@ app.post("/shopify/consume-order", async (req, res) => {
     }
 
     // DEFENSIVE LAYER 5: Normalize inputs safely
+    const originalOrderId = String(rawOrderId); // Keep original for logging
     const orderId = String(rawOrderId); // Accept string or number
     const email = String(rawEmail).toLowerCase().trim();
     const discordUserId = String(rawDiscordUserId).trim();
 
     // DEFENSIVE LAYER 6: Normalize orderId (accept numeric ID, "#1001", or "1001")
+    // TEMP DEBUG: Log original order input
+    console.log("[DEBUG] Original order input:", originalOrderId);
+    
     let normalizedOrderId = orderId.trim();
     if (normalizedOrderId.startsWith("#")) {
       normalizedOrderId = normalizedOrderId.substring(1);
     }
     normalizedOrderId = normalizedOrderId.trim();
+    
+    // TEMP DEBUG: Log normalized order input
+    console.log("[DEBUG] Normalized order input:", normalizedOrderId);
 
     // Load Shopify store credentials from MongoDB
     let store;
@@ -597,6 +630,9 @@ app.post("/shopify/consume-order", async (req, res) => {
           reason: "STORE_NOT_FOUND"
         });
       }
+      
+      // TEMP DEBUG: Log shop domain used
+      console.log("[DEBUG] Shop domain used:", store.shop);
     } catch (dbError) {
       console.error("❌ Database error loading Shopify store:", dbError);
       return res.status(500).json({
@@ -689,6 +725,9 @@ app.post("/shopify/consume-order", async (req, res) => {
 
     // Extract the real Shopify order ID from the order object
     const verifiedOrderId = String(order.id);
+    
+    // TEMP DEBUG: Log resolved Shopify order ID
+    console.log("[DEBUG] Resolved Shopify order ID:", verifiedOrderId);
 
     // Verify order is paid
     if (order.financial_status !== "paid") {
@@ -700,6 +739,11 @@ app.post("/shopify/consume-order", async (req, res) => {
 
     // Verify order email matches provided email (case-insensitive)
     const orderEmail = (order.email || "").toLowerCase().trim();
+    
+    // TEMP DEBUG: Log email comparison
+    console.log("[DEBUG] Email from Shopify:", orderEmail);
+    console.log("[DEBUG] Email from request:", email);
+    console.log("[DEBUG] Email match result:", orderEmail === email ? "MATCH" : "MISMATCH");
     
     if (orderEmail !== email) {
       return res.status(400).json({
@@ -715,6 +759,9 @@ app.post("/shopify/consume-order", async (req, res) => {
         clientId,
         orderId: verifiedOrderId
       });
+
+      // TEMP DEBUG: Log consumed count
+      console.log("[DEBUG] Consumed count:", existingConsumptionCount, "/", MAX_ORDER_USES);
 
       // TEMP: Allow up to MAX_ORDER_USES (3) per orderId
       if (existingConsumptionCount >= MAX_ORDER_USES) {
