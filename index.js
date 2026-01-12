@@ -55,6 +55,87 @@ const License = mongoose.model("License", LicenseSchema);
 
 const ShopifyStore = require("./models/ShopifyStore");
 const ConsumedOrder = require("./models/ConsumedOrder");
+const Client = require("./models/Client");
+
+/* ================= MULTI-CLIENT ARCHITECTURE ================= */
+
+/**
+ * MULTI-CLIENT SHOPIFY ARCHITECTURE OVERVIEW
+ * 
+ * This backend supports hundreds of clients, each with their own Shopify store.
+ * All Shopify-related operations are isolated per client using clientId.
+ * 
+ * CLIENT LIFECYCLE:
+ * 1. Client document is auto-created during OAuth callback (/shopify/callback)
+ *    - When a clientId doesn't exist, a new Client document is created
+ *    - This enables multi-client support without manual setup
+ * 2. Client document stores Shopify OAuth credentials in nested shopify object
+ *    - shop: Shop domain (e.g., "myshop.myshopify.com")
+ *    - accessToken: OAuth access token for API calls
+ *    - scopes: Granted OAuth scopes
+ *    - installedAt: When OAuth connection was established
+ * 3. Client can reconnect/update their Shopify store anytime
+ *    - OAuth callback updates existing Client document
+ * 
+ * OAUTH LIFECYCLE:
+ * 1. Client initiates OAuth: GET /shopify/auth?clientId=xxx&shop=xxx
+ *    - Generates secure state token with clientId
+ *    - Redirects to Shopify OAuth authorization screen
+ * 2. Shopify redirects back: GET /shopify/callback?code=xxx&state=xxx&shop=xxx
+ *    - Validates HMAC (security)
+ *    - Exchanges code for access_token
+ *    - Fetches shop info from Shopify API
+ *    - Auto-creates or updates Client document
+ * 
+ * WHERE NEW CLIENTS ARE CREATED:
+ * - Location: /shopify/callback endpoint (line ~477)
+ * - Logic: Client.findOne({ clientId }) → if null, Client.create()
+ * - This ensures every clientId gets a document on first OAuth connection
+ * 
+ * FUTURE ENDPOINTS (orders, webhooks, etc.):
+ * - MUST use getClientByClientId(clientId) helper
+ * - MUST resolve credentials from Client.shopify object
+ * - MUST never use global shop config
+ * - MUST handle clientId isolation properly
+ * 
+ * DATA ISOLATION:
+ * - Each client's Shopify data is isolated by clientId
+ * - No cross-client data access
+ * - Scalable to hundreds of clients
+ */
+
+/**
+ * Helper function to get client by clientId
+ * 
+ * This is the SINGLE SOURCE OF TRUTH for resolving client credentials.
+ * All Shopify-related endpoints MUST use this function to ensure:
+ * - Consistent client resolution
+ * - Proper error handling
+ * - Multi-client isolation
+ * 
+ * @param {string} clientId - Client identifier (required)
+ * @returns {Promise<Object|null>} - Client document with shopify credentials, or null if not found
+ * 
+ * Usage in endpoints:
+ *   const client = await getClientByClientId(clientId);
+ *   if (!client || !client.shopify || !client.shopify.accessToken) {
+ *     return res.status(404).json({ ok: false, reason: "STORE_NOT_FOUND" });
+ *   }
+ *   // Use client.shopify.shop and client.shopify.accessToken for API calls
+ */
+async function getClientByClientId(clientId) {
+  if (!clientId || typeof clientId !== "string" || clientId.trim().length === 0) {
+    return null;
+  }
+
+  try {
+    const client = await Client.findOne({ clientId: clientId.trim() });
+    return client;
+  } catch (error) {
+    console.error(`❌ Error retrieving client (clientId=${clientId}):`, error);
+    return null;
+  }
+}
 
 /* ================= ENV VALIDATION ================= */
 
@@ -150,30 +231,57 @@ app.post("/admin/generate", async (req, res) => {
 
 /**
  * GET /shopify/auth
- * Initiates Shopify OAuth flow
+ * Initiates Shopify OAuth flow for multi-client architecture
  * Query params:
- *   - clientId: Client identifier (e.g., Discord user ID)
- *   - shop: Shop domain (e.g., "myshop.myshopify.com")
+ *   - clientId: Client identifier (required, e.g., Discord user ID, Electron app ID)
+ *   - shop: Shop domain (required, e.g., "myshop.myshopify.com")
  * 
  * Flow:
- * 1. Validates required params
- * 2. Generates state token (clientId encoded for security)
- * 3. Redirects user to Shopify OAuth authorization URL
+ * 1. Validates required params (clientId, shop)
+ * 2. Validates shop domain format
+ * 3. Generates state token (clientId encoded for security)
+ * 4. Redirects user to Shopify OAuth authorization URL
+ * 
+ * Usage in Electron app:
+ *   - User clicks "Connect Shopify" button
+ *   - App redirects to: GET /shopify/auth?clientId=xxx&shop=xxx.myshopify.com
+ *   - User is redirected to Shopify OAuth screen
  */
 app.get("/shopify/auth", (req, res) => {
   const { clientId, shop } = req.query;
 
   // Validate required parameters
-  if (!clientId || !shop) {
+  if (!clientId) {
+    console.error("❌ OAuth started: Missing clientId parameter");
     return res.status(400).json({
       ok: false,
       reason: "BAD_REQUEST",
-      message: "clientId and shop query parameters are required"
+      message: "clientId query parameter is required"
+    });
+  }
+
+  if (!shop) {
+    console.error(`❌ OAuth started: Missing shop parameter for clientId: ${clientId}`);
+    return res.status(400).json({
+      ok: false,
+      reason: "BAD_REQUEST",
+      message: "shop query parameter is required"
+    });
+  }
+
+  // Validate clientId format (non-empty string)
+  if (typeof clientId !== "string" || clientId.trim().length === 0) {
+    console.error(`❌ OAuth started: Invalid clientId format: ${clientId}`);
+    return res.status(400).json({
+      ok: false,
+      reason: "INVALID_CLIENT_ID",
+      message: "clientId must be a non-empty string"
     });
   }
 
   // Validate shop domain format
   if (!shop.includes(".myshopify.com")) {
+    console.error(`❌ OAuth started: Invalid shop format for clientId: ${clientId}, shop: ${shop}`);
     return res.status(400).json({
       ok: false,
       reason: "INVALID_SHOP",
@@ -187,13 +295,16 @@ app.get("/shopify/auth", (req, res) => {
   const redirectUri = process.env.SHOPIFY_REDIRECT_URI || `${process.env.SERVER_BASE_URL}/shopify/callback`;
 
   if (!apiKey) {
-    console.error("❌ SHOPIFY_API_KEY not set in environment");
+    console.error("❌ OAuth started: SHOPIFY_API_KEY not set in environment");
     return res.status(500).json({
       ok: false,
       reason: "SERVER_ERROR",
       message: "Shopify API key not configured"
     });
   }
+
+  // Log OAuth initiation
+  console.log(`🔐 OAuth started: clientId=${clientId}, shop=${shop}`);
 
   // Create state token: base64 encode clientId + random nonce for security
   const nonce = crypto.randomBytes(16).toString("hex");
@@ -212,25 +323,124 @@ app.get("/shopify/auth", (req, res) => {
 });
 
 /**
+ * Helper function to validate Shopify HMAC
+ * @param {Object} queryParams - Query parameters from Shopify callback
+ * @param {string} apiSecret - Shopify API secret
+ * @returns {Object} - { valid: boolean, message: string }
+ */
+function validateShopifyHMAC(queryParams, apiSecret) {
+  const { hmac, ...params } = queryParams;
+  
+  // HMAC is optional but recommended for security
+  if (!hmac) {
+    return { valid: true, message: "HMAC not provided (optional)" };
+  }
+
+  // Sort parameters and create message (exclude hmac from calculation)
+  const sortedParams = Object.keys(params)
+    .sort()
+    .map(key => `${key}=${params[key]}`)
+    .join("&");
+
+  // Generate HMAC
+  const generatedHmac = crypto
+    .createHmac("sha256", apiSecret)
+    .update(sortedParams)
+    .digest("hex");
+
+  // Compare HMACs (constant-time comparison for security)
+  const isValid = crypto.timingSafeEqual(
+    Buffer.from(hmac),
+    Buffer.from(generatedHmac)
+  );
+
+  return {
+    valid: isValid,
+    message: isValid ? "HMAC valid" : "HMAC validation failed"
+  };
+}
+
+/**
+ * Helper function to fetch shop info from Shopify API
+ * @param {string} shop - Shop domain
+ * @param {string} accessToken - OAuth access token
+ * @returns {Promise<Object|null>} - Shop info object or null if failed
+ */
+function fetchShopInfo(shop, accessToken) {
+  return new Promise((resolve) => {
+    const apiVersion = process.env.SHOPIFY_API_VERSION || "2024-01";
+    const apiPath = `/admin/api/${apiVersion}/shop.json`;
+
+    const shopRequest = https.request(
+      {
+        hostname: shop,
+        path: apiPath,
+        method: "GET",
+        headers: {
+          "X-Shopify-Access-Token": accessToken,
+          "Content-Type": "application/json"
+        }
+      },
+      (shopResponse) => {
+        let data = "";
+
+        shopResponse.on("data", (chunk) => {
+          data += chunk;
+        });
+
+        shopResponse.on("end", () => {
+          if (shopResponse.statusCode === 200) {
+            try {
+              const shopData = JSON.parse(data);
+              resolve(shopData.shop || null);
+            } catch (parseError) {
+              console.error("❌ Failed to parse shop info:", parseError);
+              resolve(null);
+            }
+          } else {
+            console.error(`❌ Failed to fetch shop info: ${shopResponse.statusCode}`);
+            resolve(null);
+          }
+        });
+      }
+    );
+
+    shopRequest.on("error", (err) => {
+      console.error("❌ Error fetching shop info:", err);
+      resolve(null);
+    });
+
+    shopRequest.end();
+  });
+}
+
+/**
  * GET /shopify/callback
  * Handles Shopify OAuth callback after user approval
  * Query params (from Shopify):
  *   - code: Authorization code to exchange for access token
  *   - state: State token containing clientId (from /shopify/auth)
  *   - shop: Shop domain
- *   - hmac: HMAC for request verification (optional but recommended)
+ *   - hmac: HMAC for request verification
  * 
  * Flow:
- * 1. Validates state and extracts clientId
- * 2. Exchanges authorization code for access token via Shopify API
- * 3. Stores access token, shop domain, and scopes in MongoDB
- * 4. Redirects user to success page or returns JSON
+ * 1. Validates HMAC (security)
+ * 2. Validates state and extracts clientId
+ * 3. Exchanges authorization code for access token via Shopify API
+ * 4. Fetches shop info from Shopify API
+ * 5. Auto-creates or updates Client document in MongoDB
+ * 6. Returns success response
+ * 
+ * Usage in Electron app:
+ *   - Shopify redirects to this endpoint after OAuth approval
+ *   - App receives success response and can update UI
  */
 app.get("/shopify/callback", async (req, res) => {
-  const { code, state, shop } = req.query;
+  const { code, state, shop, hmac } = req.query;
 
   // Validate required parameters
   if (!code || !state || !shop) {
+    console.error("❌ OAuth callback: Missing required parameters");
     return res.status(400).json({
       ok: false,
       reason: "BAD_REQUEST",
@@ -244,7 +454,7 @@ app.get("/shopify/callback", async (req, res) => {
   const redirectUri = process.env.SHOPIFY_REDIRECT_URI || `${process.env.SERVER_BASE_URL}/shopify/callback`;
 
   if (!apiKey || !apiSecret) {
-    console.error("❌ SHOPIFY_API_KEY or SHOPIFY_API_SECRET not set in environment");
+    console.error("❌ OAuth callback: SHOPIFY_API_KEY or SHOPIFY_API_SECRET not set in environment");
     return res.status(500).json({
       ok: false,
       reason: "SERVER_ERROR",
@@ -252,22 +462,40 @@ app.get("/shopify/callback", async (req, res) => {
     });
   }
 
+  // Validate HMAC (security check)
+  const queryParams = { ...req.query };
+  const hmacValidation = validateShopifyHMAC(queryParams, apiSecret);
+  if (!hmacValidation.valid) {
+    console.error(`❌ OAuth callback: ${hmacValidation.message}`);
+    return res.status(400).json({
+      ok: false,
+      reason: "INVALID_HMAC",
+      message: "HMAC verification failed"
+    });
+  }
+  if (hmacValidation.message.includes("not provided")) {
+    console.warn(`⚠️  OAuth callback: ${hmacValidation.message} - proceeding without HMAC validation`);
+  }
+
   // Decode state to get clientId
   let clientId;
   try {
     const stateData = JSON.parse(Buffer.from(state, "base64").toString());
     clientId = stateData.clientId;
-    if (!clientId) {
-      throw new Error("clientId missing in state");
+    if (!clientId || typeof clientId !== "string" || clientId.trim().length === 0) {
+      throw new Error("clientId missing or invalid in state");
     }
+    clientId = clientId.trim();
   } catch (err) {
-    console.error("❌ Invalid state token:", err);
+    console.error("❌ OAuth callback: Invalid state token:", err);
     return res.status(400).json({
       ok: false,
       reason: "INVALID_STATE",
       message: "Invalid or corrupted state parameter"
     });
   }
+
+  console.log(`🔐 OAuth callback: Processing for clientId=${clientId}, shop=${shop}`);
 
   // Exchange authorization code for access token
   const tokenRequestData = querystring.stringify({
@@ -296,13 +524,12 @@ app.get("/shopify/callback", async (req, res) => {
 
         tokenResponse.on("end", async () => {
           if (tokenResponse.statusCode !== 200) {
-            console.error("❌ Shopify token exchange failed:", data);
-            const errorResponse = {
+            console.error(`❌ OAuth callback: Token exchange failed (${tokenResponse.statusCode}):`, data);
+            res.status(500).json({
               ok: false,
               reason: "TOKEN_EXCHANGE_FAILED",
               message: "Failed to exchange authorization code for access token"
-            };
-            res.status(500).json(errorResponse);
+            });
             return resolve();
           }
 
@@ -314,24 +541,49 @@ app.get("/shopify/callback", async (req, res) => {
               throw new Error("Access token missing in Shopify response");
             }
 
-            // Store or update Shopify store credentials in MongoDB
+            console.log(`✅ OAuth callback: Token exchange successful for clientId=${clientId}`);
+
+            // Fetch shop info from Shopify API
+            const shopInfo = await fetchShopInfo(shop, access_token);
+            if (shopInfo) {
+              console.log(`✅ OAuth callback: Shop info fetched for clientId=${clientId}, shop name: ${shopInfo.name || "N/A"}`);
+            } else {
+              console.warn(`⚠️  OAuth callback: Failed to fetch shop info for clientId=${clientId}, continuing anyway`);
+            }
+
+            // Auto-create or update Client document in MongoDB
             try {
-              await ShopifyStore.findOneAndUpdate(
-                { clientId },
-                {
+              // Check if client exists
+              let client = await Client.findOne({ clientId });
+
+              if (!client) {
+                // Auto-create new client document
+                client = await Client.create({
                   clientId,
+                  shopify: {
+                    shop,
+                    accessToken: access_token,
+                    scopes: scope || process.env.SHOPIFY_SCOPES || "",
+                    installedAt: new Date()
+                  },
+                  createdAt: new Date()
+                });
+                console.log(`✅ Client created: clientId=${clientId}`);
+              } else {
+                // Update existing client's Shopify connection
+                client.shopify = {
                   shop,
                   accessToken: access_token,
                   scopes: scope || process.env.SHOPIFY_SCOPES || "",
-                  connectedAt: new Date(),
-                  lastUsedAt: new Date()
-                },
-                { upsert: true, new: true }
-              );
+                  installedAt: new Date()
+                };
+                await client.save();
+                console.log(`✅ Client updated: clientId=${clientId}`);
+              }
 
-              console.log(`✅ Shopify store connected for client: ${clientId}, shop: ${shop}`);
+              console.log(`✅ OAuth success: clientId=${clientId}, shop=${shop}`);
 
-              // Return success response (bot can handle redirect or JSON)
+              // Return success response
               res.json({
                 ok: true,
                 message: "Shopify store connected successfully",
@@ -339,15 +591,15 @@ app.get("/shopify/callback", async (req, res) => {
                 clientId
               });
             } catch (dbError) {
-              console.error("❌ Database error saving Shopify store:", dbError);
+              console.error(`❌ OAuth callback: Database error for clientId=${clientId}:`, dbError);
               res.status(500).json({
                 ok: false,
                 reason: "DB_ERROR",
-                message: "Failed to save Shopify store credentials"
+                message: "Failed to save client connection"
               });
             }
           } catch (parseError) {
-            console.error("❌ Failed to parse Shopify token response:", parseError);
+            console.error(`❌ OAuth callback: Failed to parse token response for clientId=${clientId}:`, parseError);
             res.status(500).json({
               ok: false,
               reason: "PARSE_ERROR",
@@ -361,7 +613,7 @@ app.get("/shopify/callback", async (req, res) => {
     );
 
     tokenRequest.on("error", (err) => {
-      console.error("❌ Request error during token exchange:", err);
+      console.error(`❌ OAuth callback: Request error for clientId=${clientId}:`, err);
       res.status(500).json({
         ok: false,
         reason: "REQUEST_ERROR",
@@ -391,10 +643,17 @@ app.get("/shopify/callback", async (req, res) => {
  * 
  * Flow:
  * 1. Validates required query parameters (clientId, email)
- * 2. Loads Shopify store credentials from MongoDB using clientId
- * 3. Makes authenticated request to Shopify Admin API to fetch recent orders
+ * 2. Loads client and Shopify credentials from MongoDB using getClientByClientId(clientId)
+ *    - Multi-client architecture: Each client has isolated Shopify credentials
+ *    - Returns STORE_NOT_FOUND if client doesn't exist or hasn't connected Shopify
+ * 3. Makes authenticated request to Shopify Admin API using client's shop and accessToken
  * 4. Filters orders by email (case-insensitive) and financial_status = "paid"
  * 5. Returns whether a paid order exists and the order ID if found
+ * 
+ * Multi-client isolation:
+ * - Each clientId resolves to their own Shopify store
+ * - No cross-client data access
+ * - Scalable to hundreds of clients
  */
 app.get("/shopify/verify-order", async (req, res) => {
   const { clientId, email } = req.query;
@@ -408,11 +667,11 @@ app.get("/shopify/verify-order", async (req, res) => {
     });
   }
 
-  // Load Shopify store credentials from MongoDB
-  let store;
+  // Load client and Shopify credentials from MongoDB (multi-client architecture)
+  let client;
   try {
-    store = await ShopifyStore.findOne({ clientId });
-    if (!store) {
+    client = await getClientByClientId(clientId);
+    if (!client || !client.shopify || !client.shopify.accessToken) {
       return res.status(404).json({
         ok: false,
         reason: "STORE_NOT_FOUND",
@@ -420,22 +679,17 @@ app.get("/shopify/verify-order", async (req, res) => {
       });
     }
   } catch (dbError) {
-    console.error("❌ Database error loading Shopify store:", dbError);
+    console.error(`❌ Database error loading client (clientId=${clientId}):`, dbError);
     return res.status(500).json({
       ok: false,
       reason: "DB_ERROR",
-      message: "Failed to load Shopify store credentials"
+      message: "Failed to load client credentials"
     });
   }
 
-  // Update lastUsedAt timestamp
-  try {
-    store.lastUsedAt = new Date();
-    await store.save();
-  } catch (updateError) {
-    // Non-fatal: continue even if timestamp update fails
-    console.warn("⚠️  Failed to update lastUsedAt:", updateError);
-  }
+  // Extract Shopify credentials from client document (multi-client isolation)
+  const shop = client.shopify.shop;
+  const accessToken = client.shopify.accessToken;
 
   // Prepare Shopify API request
   // Use Shopify Admin REST API to fetch orders
@@ -446,11 +700,11 @@ app.get("/shopify/verify-order", async (req, res) => {
   return new Promise((resolve) => {
     const apiRequest = https.request(
       {
-        hostname: store.shop,
+        hostname: shop,
         path: apiPath,
         method: "GET",
         headers: {
-          "X-Shopify-Access-Token": store.accessToken,
+          "X-Shopify-Access-Token": accessToken,
           "Content-Type": "application/json"
         }
       },
@@ -540,8 +794,10 @@ app.get("/shopify/verify-order", async (req, res) => {
  * 
  * Flow:
  * 1. Validates required request body fields (clientId, orderId, email, discordUserId)
- * 2. Loads Shopify store credentials from MongoDB
- * 3. Fetches specific order by orderId from Shopify API
+ * 2. Loads client and Shopify credentials from MongoDB using getClientByClientId(clientId)
+ *    - Multi-client architecture: Each client has isolated Shopify credentials
+ *    - Returns STORE_NOT_FOUND if client doesn't exist or hasn't connected Shopify
+ * 3. Fetches specific order by orderId from Shopify API using client's shop and accessToken
  * 4. Verifies order exists, is paid, and email matches
  * 5. Counts how many times this orderId has already been consumed
  * 6. If count < MAX_ORDER_USES, stores new consumption record
@@ -624,11 +880,11 @@ app.post("/shopify/consume-order", async (req, res) => {
     const inputType = normalizedOrderId.length > 10 ? "id" : "order_number";
     console.log("[DEBUG] Input type detected:", inputType);
 
-    // Load Shopify store credentials from MongoDB
-    let store;
+    // Load client and Shopify credentials from MongoDB (multi-client architecture)
+    let client;
     try {
-      store = await ShopifyStore.findOne({ clientId });
-      if (!store) {
+      client = await getClientByClientId(clientId);
+      if (!client || !client.shopify || !client.shopify.accessToken) {
         return res.status(404).json({
           ok: false,
           reason: "STORE_NOT_FOUND"
@@ -636,14 +892,18 @@ app.post("/shopify/consume-order", async (req, res) => {
       }
       
       // TEMP DEBUG: Log shop domain used
-      console.log("[DEBUG] Shop domain used:", store.shop);
+      console.log("[DEBUG] Shop domain used:", client.shopify.shop);
     } catch (dbError) {
-      console.error("❌ Database error loading Shopify store:", dbError);
+      console.error(`❌ Database error loading client (clientId=${clientId}):`, dbError);
       return res.status(500).json({
         ok: false,
         reason: "INTERNAL_ERROR"
       });
     }
+
+    // Extract Shopify credentials from client document (multi-client isolation)
+    const shop = client.shopify.shop;
+    const accessToken = client.shopify.accessToken;
 
     // Helper function to fetch order by Shopify ID
     const fetchOrderById = (orderId) => {
@@ -653,11 +913,11 @@ app.post("/shopify/consume-order", async (req, res) => {
 
         const apiRequest = https.request(
           {
-            hostname: store.shop,
+            hostname: shop,
             path: apiPath,
             method: "GET",
             headers: {
-              "X-Shopify-Access-Token": store.accessToken,
+              "X-Shopify-Access-Token": accessToken,
               "Content-Type": "application/json"
             }
           },
@@ -701,11 +961,11 @@ app.post("/shopify/consume-order", async (req, res) => {
 
         const apiRequest = https.request(
           {
-            hostname: store.shop,
+            hostname: shop,
             path: apiPath,
             method: "GET",
             headers: {
-              "X-Shopify-Access-Token": store.accessToken,
+              "X-Shopify-Access-Token": accessToken,
               "Content-Type": "application/json"
             }
           },
