@@ -1522,6 +1522,118 @@ app.post("/client/theme", async (req, res) => {
   }
 });
 
+/**
+ * GET /client/:clientId
+ * Fetches client theme color
+ * NEVER returns 404 - always returns a valid theme response
+ * 
+ * URL params:
+ *   - clientId: Client identifier (required)
+ * 
+ * Usage in Discord Bot:
+ *   - Bot fetches client theme when creating menu
+ *   - Always receives a valid color (default if missing)
+ *   - Menu creation never fails due to missing theme
+ * 
+ * Flow:
+ * 1. Extracts clientId from URL parameter
+ * 2. Looks up client in MongoDB by clientId
+ * 3. If client exists and has theme.color:
+ *    - Returns client's theme color
+ * 4. If client doesn't exist or has no theme:
+ *    - Returns default theme color "#166534" (dark green)
+ * 5. Always returns 200 status with valid response
+ * 
+ * Response format (ALWAYS 200):
+ * {
+ *   ok: true,
+ *   clientId: string,
+ *   theme: {
+ *     color: "#166534" | client's color
+ *   }
+ * }
+ */
+app.get("/client/:clientId", async (req, res) => {
+  try {
+    // Extract clientId from URL parameter
+    const rawClientId = req.params.clientId;
+    
+    // Validate clientId is present
+    if (!rawClientId || (typeof rawClientId === "string" && rawClientId.trim().length === 0)) {
+      // Even if invalid, return default theme (never 404)
+      const defaultColor = "#166534";
+      console.log(`[THEME] Invalid clientId provided, using default theme: ${defaultColor}`);
+      return res.status(200).json({
+        ok: true,
+        clientId: rawClientId || "",
+        theme: {
+          color: defaultColor
+        }
+      });
+    }
+
+    const clientId = String(rawClientId).trim();
+    const defaultColor = "#166534"; // Default dark green theme
+
+    // Look up client in MongoDB
+    let client;
+    let usedDefault = false;
+    
+    try {
+      client = await Client.findOne({ clientId: clientId });
+      
+      if (!client) {
+        // Client doesn't exist - use default
+        usedDefault = true;
+        console.log(`[THEME] Client not found: clientId=${clientId}, using default theme: ${defaultColor}`);
+      } else if (!client.theme || !client.theme.color) {
+        // Client exists but has no theme - use default
+        usedDefault = true;
+        console.log(`[THEME] Client found but no theme set: clientId=${clientId}, using default theme: ${defaultColor}`);
+      } else {
+        // Client exists and has theme color
+        const clientColor = client.theme.color;
+        console.log(`[THEME] Client theme found: clientId=${clientId}, color=${clientColor}`);
+        
+        // Return client's theme color
+        return res.status(200).json({
+          ok: true,
+          clientId: clientId,
+          theme: {
+            color: clientColor
+          }
+        });
+      }
+    } catch (dbError) {
+      // Database error - use default (never 404)
+      console.error(`❌ Database error fetching client theme (clientId=${clientId}):`, dbError);
+      usedDefault = true;
+    }
+
+    // Return default theme (client not found or no theme set)
+    return res.status(200).json({
+      ok: true,
+      clientId: clientId,
+      theme: {
+        color: defaultColor
+      }
+    });
+
+  } catch (error) {
+    // FINAL CRASH-PROOF LAYER: Catch any unhandled errors
+    // Even on error, return default theme (never 404)
+    console.error("❌ Unhandled error in GET /client/:clientId:", error);
+    const defaultColor = "#166534";
+    return res.status(200).json({
+      ok: true,
+      clientId: req.params.clientId || "",
+      theme: {
+        color: defaultColor
+      }
+    });
+  }
+});
+
 /* ================= START ================= */
 
 const PORT = process.env.PORT || 10000;
