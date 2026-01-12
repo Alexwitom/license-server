@@ -1437,7 +1437,7 @@ app.post("/shopify/consume-order", async (req, res) => {
 
 /**
  * POST /client/theme
- * Updates or sets the theme color for a client
+ * Updates the theme color for an existing client
  * 
  * Request body:
  *   - clientId: Client identifier (required)
@@ -1451,14 +1451,20 @@ app.post("/shopify/consume-order", async (req, res) => {
  * Flow:
  * 1. Validates required fields (clientId, color)
  * 2. Validates HEX color format (#RRGGBB)
- * 3. Upserts client document by clientId
- * 4. Saves theme.color to MongoDB
+ * 3. Checks if client exists (MUST exist - no implicit creation)
+ * 4. Updates theme.color using updateOne with upsert: false
  * 5. Returns success with saved color
+ * 
+ * CRITICAL RULES:
+ * - Client document MUST exist before saving theme
+ * - Client can ONLY be created during Shopify OAuth or WooCommerce config save
+ * - NEVER create client implicitly during theme save
+ * - Returns CLIENT_NOT_FOUND error if client doesn't exist
  * 
  * Multi-client support:
  * - Each clientId has its own theme color
  * - Safe for hundreds of clients
- * - Upsert creates client if it doesn't exist
+ * - One clientId = one Mongo document
  */
 app.post("/client/theme", async (req, res) => {
   try {
@@ -1520,24 +1526,62 @@ app.post("/client/theme", async (req, res) => {
       });
     }
 
-    // Log theme update
-    console.log(`🎨 Theme update: clientId=${clientId}, color=${color}`);
+    // Log theme save attempt
+    console.log(`[THEME_SAVE] Attempting to save theme: clientId=${clientId}, color=${color}`);
 
-    // Upsert client document with theme color
-    // Uses updateOne with $set to only update theme.color, preserving other fields
+    // CRITICAL: Check if client exists BEFORE updating
+    // Client MUST exist - never create implicitly during theme save
+    let existingClient;
     try {
-      await Client.updateOne(
+      existingClient = await Client.findOne({ clientId: clientId });
+    } catch (dbError) {
+      console.error(`❌ [THEME_SAVE] Database error checking client existence (clientId=${clientId}):`, dbError);
+      return res.status(500).json({
+        ok: false,
+        reason: "INTERNAL_ERROR",
+        message: "Failed to check client existence"
+      });
+    }
+
+    // If client doesn't exist, return error (DO NOT create)
+    if (!existingClient) {
+      console.warn(`⚠️  [THEME_SAVE] WARNING: Theme save attempted for non-existing client: clientId=${clientId}`);
+      return res.status(404).json({
+        ok: false,
+        reason: "CLIENT_NOT_FOUND",
+        message: `Client with clientId=${clientId} does not exist. Client must be created during Shopify OAuth or WooCommerce configuration.`
+      });
+    }
+
+    // Client exists - update theme color using updateOne with upsert: false
+    // This ensures we NEVER create a client during theme save
+    try {
+      const updateResult = await Client.updateOne(
         { clientId: clientId },
         {
           $set: {
             "theme.color": color
           }
         },
-        { upsert: true }
+        { upsert: false } // CRITICAL: upsert: false - never create client here
       );
 
-      // Log saved color for verification
-      console.log(`✅ Theme saved: clientId=${clientId}, color=${color}`);
+      // Log update result
+      if (updateResult.matchedCount === 0) {
+        // This should never happen since we checked existence above, but log it anyway
+        console.error(`❌ [THEME_SAVE] Update matched 0 documents (unexpected): clientId=${clientId}`);
+        return res.status(404).json({
+          ok: false,
+          reason: "CLIENT_NOT_FOUND",
+          message: `Client with clientId=${clientId} was not found during update`
+        });
+      }
+
+      if (updateResult.modifiedCount === 1) {
+        console.log(`✅ [THEME_SAVE] Theme updated: clientId=${clientId}, color=${color} (update occurred)`);
+      } else if (updateResult.modifiedCount === 0) {
+        console.log(`ℹ️  [THEME_SAVE] Theme unchanged: clientId=${clientId}, color=${color} (no update needed - color already set)`);
+      }
 
       // Return success response
       return res.json({
@@ -1546,7 +1590,7 @@ app.post("/client/theme", async (req, res) => {
         color: color
       });
     } catch (dbError) {
-      console.error(`❌ Database error updating theme (clientId=${clientId}):`, dbError);
+      console.error(`❌ [THEME_SAVE] Database error updating theme (clientId=${clientId}):`, dbError);
       return res.status(500).json({
         ok: false,
         reason: "INTERNAL_ERROR",
@@ -1556,7 +1600,7 @@ app.post("/client/theme", async (req, res) => {
 
   } catch (error) {
     // FINAL CRASH-PROOF LAYER: Catch any unhandled errors
-    console.error("❌ Unhandled error in /client/theme:", error);
+    console.error("❌ [THEME_SAVE] Unhandled error in /client/theme:", error);
     return res.status(500).json({
       ok: false,
       reason: "INTERNAL_ERROR",
@@ -1569,6 +1613,7 @@ app.post("/client/theme", async (req, res) => {
  * GET /client/:clientId
  * Fetches client theme color
  * NEVER returns 404 - always returns a valid theme response
+ * NEVER creates or modifies client - read-only operation
  * 
  * URL params:
  *   - clientId: Client identifier (required)
@@ -1580,12 +1625,17 @@ app.post("/client/theme", async (req, res) => {
  * 
  * Flow:
  * 1. Extracts clientId from URL parameter
- * 2. Looks up client in MongoDB by clientId
+ * 2. Looks up client in MongoDB by clientId (read-only)
  * 3. If client exists and has theme.color:
  *    - Returns client's theme color
  * 4. If client doesn't exist or has no theme:
  *    - Returns default theme color "#166534" (dark green)
  * 5. Always returns 200 status with valid response
+ * 
+ * CRITICAL RULES:
+ * - NEVER creates or modifies client document
+ * - Read-only operation
+ * - Always returns valid response (never 404)
  * 
  * Response format (ALWAYS 200):
  * {
@@ -1605,7 +1655,7 @@ app.get("/client/:clientId", async (req, res) => {
     if (!rawClientId || (typeof rawClientId === "string" && rawClientId.trim().length === 0)) {
       // Even if invalid, return default theme (never 404)
       const defaultColor = "#166534";
-      console.log(`[THEME] Invalid clientId provided, using default theme: ${defaultColor}`);
+      console.log(`[THEME_FETCH] Invalid clientId provided, using default theme: ${defaultColor}`);
       return res.status(200).json({
         ok: true,
         clientId: rawClientId || "",
@@ -1618,25 +1668,30 @@ app.get("/client/:clientId", async (req, res) => {
     const clientId = String(rawClientId).trim();
     const defaultColor = "#166534"; // Default dark green theme
 
-    // Look up client in MongoDB
+    // Log theme fetch attempt
+    console.log(`[THEME_FETCH] Fetching theme: clientId=${clientId}`);
+
+    // Look up client in MongoDB (read-only - never create or modify)
     let client;
     let usedDefault = false;
+    let readOccurred = false;
     
     try {
       client = await Client.findOne({ clientId: clientId });
+      readOccurred = true;
       
       if (!client) {
         // Client doesn't exist - use default
         usedDefault = true;
-        console.log(`[THEME] Client not found: clientId=${clientId}, using default theme: ${defaultColor}`);
+        console.log(`[THEME_FETCH] Client not found: clientId=${clientId}, using default theme: ${defaultColor} (read occurred, client not found)`);
       } else if (!client.theme || !client.theme.color) {
         // Client exists but has no theme - use default
         usedDefault = true;
-        console.log(`[THEME] Client found but no theme set: clientId=${clientId}, using default theme: ${defaultColor}`);
+        console.log(`[THEME_FETCH] Client found but no theme set: clientId=${clientId}, using default theme: ${defaultColor} (read occurred, theme missing)`);
       } else {
         // Client exists and has theme color
         const clientColor = client.theme.color;
-        console.log(`[THEME] Client theme found: clientId=${clientId}, color=${clientColor}`);
+        console.log(`[THEME_FETCH] Client theme found: clientId=${clientId}, color=${clientColor} (read occurred, theme returned)`);
         
         // Return client's theme color
         return res.status(200).json({
@@ -1649,11 +1704,13 @@ app.get("/client/:clientId", async (req, res) => {
       }
     } catch (dbError) {
       // Database error - use default (never 404)
-      console.error(`❌ Database error fetching client theme (clientId=${clientId}):`, dbError);
+      console.error(`❌ [THEME_FETCH] Database error fetching client theme (clientId=${clientId}):`, dbError);
       usedDefault = true;
+      readOccurred = false; // Read failed
     }
 
     // Return default theme (client not found or no theme set)
+    console.log(`[THEME_FETCH] Returning default theme: clientId=${clientId}, color=${defaultColor} (read occurred: ${readOccurred}, used default: ${usedDefault})`);
     return res.status(200).json({
       ok: true,
       clientId: clientId,
@@ -1665,7 +1722,7 @@ app.get("/client/:clientId", async (req, res) => {
   } catch (error) {
     // FINAL CRASH-PROOF LAYER: Catch any unhandled errors
     // Even on error, return default theme (never 404)
-    console.error("❌ Unhandled error in GET /client/:clientId:", error);
+    console.error("❌ [THEME_FETCH] Unhandled error in GET /client/:clientId:", error);
     const defaultColor = "#166534";
     return res.status(200).json({
       ok: true,
