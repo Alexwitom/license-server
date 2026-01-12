@@ -1481,20 +1481,20 @@ app.post("/client/theme", async (req, res) => {
     console.log(`🎨 Theme update: clientId=${clientId}, color=${color}`);
 
     // Upsert client document with theme color
+    // Uses updateOne with $set to only update theme.color, preserving other fields
     try {
-      const client = await Client.findOneAndUpdate(
+      await Client.updateOne(
         { clientId: clientId },
         {
           $set: {
             "theme.color": color
           }
         },
-        {
-          upsert: true,
-          new: true,
-          setDefaultsOnInsert: true
-        }
+        { upsert: true }
       );
+
+      // Log saved color for verification
+      console.log(`✅ Theme saved: clientId=${clientId}, color=${color}`);
 
       // Return success response
       return res.json({
