@@ -6,31 +6,10 @@ const querystring = require("querystring");
 
 const app = express();
 
-// Configure body parsers
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-// Safe JSON guard middleware: reject non-JSON requests before routes
-app.use((req, res, next) => {
-  // Debug log Content-Type
-  console.log("[DEBUG] Content-Type:", req.headers["content-type"]);
-  
-  // Skip Content-Type check for GET requests (no body expected)
-  if (req.method === "GET" || req.method === "HEAD") {
-    return next();
-  }
-  
-  // For requests with body, require application/json Content-Type
-  const contentType = req.headers["content-type"] || "";
-  if (!contentType.includes("application/json")) {
-    return res.status(400).json({
-      ok: false,
-      reason: "INVALID_CONTENT_TYPE"
-    });
-  }
-  
-  next();
-});
+// Configure body parsers - accept multiple content types for crash-proof parsing
+app.use(express.json({ strict: false, limit: "1mb" })); // Accept malformed JSON
+app.use(express.text({ type: "*/*", limit: "1mb" })); // Accept text/plain and any other type
+app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 
 /* ================= MONGO ================= */
 
@@ -554,193 +533,182 @@ app.get("/shopify/verify-order", async (req, res) => {
 const MAX_ORDER_USES = 3;
 
 app.post("/shopify/consume-order", async (req, res) => {
-  // TEMPORARY DEBUG: Log content-type and raw body
-  const contentType = req.headers['content-type'] || '';
-  const rawBody = req.body ? JSON.stringify(req.body).substring(0, 200) : '(empty)';
-  console.log(`🔍 [DEBUG] Content-Type: "${contentType}"`);
-  console.log(`🔍 [DEBUG] Raw body (first 200 chars): ${rawBody}`);
-
-  // Defensive guard: Require Content-Type to be application/json
-  if (!contentType.includes('application/json')) {
-    return res.status(400).json({
-      ok: false,
-      reason: "INVALID_CONTENT_TYPE",
-      message: "Content-Type must be application/json"
-    });
-  }
-
-  // Defensive guard: Ensure body is an object (not null, undefined, or primitive)
-  if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
-    return res.status(400).json({
-      ok: false,
-      reason: "INVALID_BODY",
-      message: "Request body must be a JSON object"
-    });
-  }
-
-  const { clientId, orderId, email, discordUserId } = req.body;
-
-  // Validate required request body fields (orderId is now explicitly required)
-  if (!clientId || !orderId || !email || !discordUserId) {
-    return res.status(400).json({
-      ok: false,
-      reason: "BAD_REQUEST",
-      message: "clientId, orderId, email, and discordUserId are required in request body"
-    });
-  }
-
-  // TEMPORARY DEBUG: Log received orderId
-  console.log(`🔍 [DEBUG] Received orderId: "${orderId}"`);
-
-  // Normalize orderId: trim spaces and remove leading "#" if present
-  const originalOrderId = orderId;
-  let normalizedOrderId = String(orderId).trim();
-  if (normalizedOrderId.startsWith("#")) {
-    normalizedOrderId = normalizedOrderId.substring(1);
-  }
-  
-  // TEMPORARY DEBUG: Log normalized orderId
-  console.log(`🔍 [DEBUG] Normalized orderId: "${normalizedOrderId}"`);
-
-  // Load Shopify store credentials from MongoDB
-  let store;
+  // CRASH-PROOF WRAPPER: Ensure endpoint always returns JSON, never crashes
   try {
-    store = await ShopifyStore.findOne({ clientId });
-    if (!store) {
-      return res.status(404).json({
+    // TEMPORARY DEBUG: Log raw headers and body
+    console.log("[DEBUG] Raw headers:", JSON.stringify(req.headers, null, 2));
+    const rawBodyBeforeParse = typeof req.body === 'string' ? req.body.substring(0, 200) : (req.body ? JSON.stringify(req.body).substring(0, 200) : '(empty)');
+    console.log("[DEBUG] Raw body (before parsing, first 200 chars):", rawBodyBeforeParse);
+
+    // DEFENSIVE LAYER 1: Safe JSON parsing if body is a string
+    let body = req.body;
+    if (typeof body === 'string') {
+      try {
+        body = JSON.parse(body);
+      } catch (parseError) {
+        return res.status(400).json({
+          ok: false,
+          reason: "INVALID_REQUEST"
+        });
+      }
+    }
+
+    // DEFENSIVE LAYER 2: Ensure body is an object
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return res.status(400).json({
         ok: false,
-        reason: "STORE_NOT_FOUND",
-        message: "No Shopify store connected for this client"
+        reason: "INVALID_REQUEST"
       });
     }
-  } catch (dbError) {
-    console.error("❌ Database error loading Shopify store:", dbError);
-    return res.status(500).json({
-      ok: false,
-      reason: "DB_ERROR",
-      message: "Failed to load Shopify store credentials"
-    });
-  }
 
-  // Helper function to fetch order from Shopify API
-  const fetchOrderFromShopify = (identifier, isOrderNumber = false) => {
-    return new Promise((resolve, reject) => {
-      const apiVersion = process.env.SHOPIFY_API_VERSION || "2024-01";
-      // If searching by order_number, use query parameter; otherwise use path parameter
-      const apiPath = isOrderNumber
-        ? `/admin/api/${apiVersion}/orders.json?name=${encodeURIComponent(identifier)}`
-        : `/admin/api/${apiVersion}/orders/${identifier}.json`;
+    // DEFENSIVE LAYER 3: Normalize and extract input fields safely
+    const clientId = body.clientId ? String(body.clientId).trim() || "main" : "main";
+    const rawOrderId = body.orderId;
+    const rawEmail = body.email;
+    const rawDiscordUserId = body.discordUserId;
 
-      const apiRequest = https.request(
-        {
-          hostname: store.shop,
-          path: apiPath,
-          method: "GET",
-          headers: {
-            "X-Shopify-Access-Token": store.accessToken,
-            "Content-Type": "application/json"
-          }
-        },
-        (apiResponse) => {
-          let data = "";
-
-          apiResponse.on("data", (chunk) => {
-            data += chunk;
-          });
-
-          apiResponse.on("end", () => {
-            if (apiResponse.statusCode === 200) {
-              try {
-                const responseData = JSON.parse(data);
-                // When searching by order_number, response is { orders: [...] }
-                // When searching by ID, response is { order: {...} }
-                const order = isOrderNumber
-                  ? (responseData.orders && responseData.orders.length > 0 ? responseData.orders[0] : null)
-                  : responseData.order;
-                resolve(order);
-              } catch (parseError) {
-                reject(new Error(`Failed to parse response: ${parseError.message}`));
-              }
-            } else if (apiResponse.statusCode === 404) {
-              resolve(null); // Order not found
-            } else {
-              reject(new Error(`API error ${apiResponse.statusCode}: ${data}`));
-            }
-          });
-        }
-      );
-
-      apiRequest.on("error", (err) => {
-        reject(err);
+    // DEFENSIVE LAYER 4: Validate required fields exist
+    if (!rawOrderId || !rawEmail || !rawDiscordUserId) {
+      return res.status(400).json({
+        ok: false,
+        reason: "INVALID_REQUEST"
       });
+    }
 
-      apiRequest.end();
-    });
+    // DEFENSIVE LAYER 5: Normalize inputs safely
+    const orderId = String(rawOrderId); // Accept string or number
+    const email = String(rawEmail).toLowerCase().trim();
+    const discordUserId = String(rawDiscordUserId).trim();
+
+    // DEFENSIVE LAYER 6: Normalize orderId (accept numeric ID, "#1001", or "1001")
+    let normalizedOrderId = orderId.trim();
+    if (normalizedOrderId.startsWith("#")) {
+      normalizedOrderId = normalizedOrderId.substring(1);
+    }
+    normalizedOrderId = normalizedOrderId.trim();
+
+    // Load Shopify store credentials from MongoDB
+    let store;
+    try {
+      store = await ShopifyStore.findOne({ clientId });
+      if (!store) {
+        return res.status(404).json({
+          ok: false,
+          reason: "STORE_NOT_FOUND"
+        });
+      }
+    } catch (dbError) {
+      console.error("❌ Database error loading Shopify store:", dbError);
+      return res.status(500).json({
+        ok: false,
+        reason: "INTERNAL_ERROR"
+      });
+    }
+
+    // Helper function to fetch order from Shopify API
+    const fetchOrderFromShopify = (identifier, isOrderNumber = false) => {
+      return new Promise((resolve, reject) => {
+        const apiVersion = process.env.SHOPIFY_API_VERSION || "2024-01";
+        // If searching by order_number, use query parameter; otherwise use path parameter
+        const apiPath = isOrderNumber
+          ? `/admin/api/${apiVersion}/orders.json?name=${encodeURIComponent(identifier)}`
+          : `/admin/api/${apiVersion}/orders/${identifier}.json`;
+
+        const apiRequest = https.request(
+          {
+            hostname: store.shop,
+            path: apiPath,
+            method: "GET",
+            headers: {
+              "X-Shopify-Access-Token": store.accessToken,
+              "Content-Type": "application/json"
+            }
+          },
+          (apiResponse) => {
+            let data = "";
+
+            apiResponse.on("data", (chunk) => {
+              data += chunk;
+            });
+
+            apiResponse.on("end", () => {
+              if (apiResponse.statusCode === 200) {
+                try {
+                  const responseData = JSON.parse(data);
+                  // When searching by order_number, response is { orders: [...] }
+                  // When searching by ID, response is { order: {...} }
+                  const order = isOrderNumber
+                    ? (responseData.orders && responseData.orders.length > 0 ? responseData.orders[0] : null)
+                    : responseData.order;
+                  resolve(order);
+                } catch (parseError) {
+                  reject(new Error(`Failed to parse response: ${parseError.message}`));
+                }
+              } else if (apiResponse.statusCode === 404) {
+                resolve(null); // Order not found
+              } else {
+                reject(new Error(`API error ${apiResponse.statusCode}: ${data}`));
+              }
+            });
+          }
+        );
+
+        apiRequest.on("error", (err) => {
+          reject(err);
+        });
+
+        apiRequest.end();
+      });
   };
 
-  // Try to fetch order: first by ID, then by order_number if not found
-  let order = null;
-  try {
-    // First attempt: try as numeric ID
-    order = await fetchOrderFromShopify(normalizedOrderId, false);
-    
-    // If not found and normalizedOrderId looks like it could be an order number, try by order_number
-    if (!order && normalizedOrderId && !/^\d+$/.test(normalizedOrderId)) {
-      order = await fetchOrderFromShopify(normalizedOrderId, true);
-    } else if (!order) {
-      // If it's numeric and not found, also try as order_number
-      order = await fetchOrderFromShopify(normalizedOrderId, true);
+    // Try to fetch order: first by ID, then by order_number if not found
+    let order = null;
+    try {
+      // First attempt: try as numeric ID
+      order = await fetchOrderFromShopify(normalizedOrderId, false);
+      
+      // If not found, try by order_number
+      if (!order) {
+        order = await fetchOrderFromShopify(normalizedOrderId, true);
+      }
+    } catch (fetchError) {
+      console.error("❌ Error fetching order from Shopify:", fetchError);
+      return res.status(500).json({
+        ok: false,
+        reason: "INTERNAL_ERROR"
+      });
     }
-  } catch (fetchError) {
-    console.error("❌ Error fetching order from Shopify:", fetchError);
-    return res.status(500).json({
-      ok: false,
-      reason: "SHOPIFY_API_ERROR",
-      message: "Failed to fetch order from Shopify"
-    });
-  }
 
-  // Verify order exists
-  if (!order) {
-    return res.status(404).json({
-      ok: false,
-      reason: "ORDER_NOT_FOUND",
-      message: "Order not found in Shopify store"
-    });
-  }
+    // Verify order exists
+    if (!order) {
+      return res.status(404).json({
+        ok: false,
+        reason: "ORDER_NOT_FOUND"
+      });
+    }
 
-  // Extract the real Shopify order ID from the order object
-  const verifiedOrderId = String(order.id);
-  
-  // TEMPORARY DEBUG: Log resolved Shopify order ID
-  console.log(`🔍 [DEBUG] Resolved Shopify order ID: ${verifiedOrderId}`);
-
-  // Continue with order verification
-  try {
+    // Extract the real Shopify order ID from the order object
+    const verifiedOrderId = String(order.id);
 
     // Verify order is paid
     if (order.financial_status !== "paid") {
       return res.status(400).json({
         ok: false,
-        reason: "ORDER_NOT_PAID",
-        message: "Order is not paid"
+        reason: "ORDER_NOT_PAID"
       });
     }
 
     // Verify order email matches provided email (case-insensitive)
-    const emailLower = email.toLowerCase().trim();
     const orderEmail = (order.email || "").toLowerCase().trim();
     
-    if (orderEmail !== emailLower) {
+    if (orderEmail !== email) {
       return res.status(400).json({
         ok: false,
-        reason: "ORDER_EMAIL_MISMATCH",
-        message: "Order email does not match provided email"
+        reason: "ORDER_EMAIL_MISMATCH"
       });
     }
 
-    // TEMPORARY TESTING: Count existing consumptions instead of blocking on first use
-    // TODO: REVERT to single-use for production (check if exists and block if found)
+    // DEFENSIVE LAYER 7: Check consumed order count (TEMP SAFE MODE - allows up to 3 uses)
     let existingConsumptionCount;
     try {
       existingConsumptionCount = await ConsumedOrder.countDocuments({
@@ -748,38 +716,33 @@ app.post("/shopify/consume-order", async (req, res) => {
         orderId: verifiedOrderId
       });
 
-      // TEMPORARY: Allow multiple uses up to MAX_ORDER_USES limit
-      // PRODUCTION: Change this to block on first use (count >= 1)
+      // TEMP: Allow up to MAX_ORDER_USES (3) per orderId
       if (existingConsumptionCount >= MAX_ORDER_USES) {
-        return res.status(409).json({
+        return res.status(400).json({
           ok: false,
-          reason: "ORDER_USE_LIMIT_REACHED",
-          message: `This order has reached the maximum use limit (${MAX_ORDER_USES})`
+          reason: "ORDER_ALREADY_USED"
         });
       }
     } catch (checkError) {
       console.error("❌ Database error checking consumed order count:", checkError);
       return res.status(500).json({
         ok: false,
-        reason: "DB_ERROR",
-        message: "Failed to check order consumption count"
+        reason: "INTERNAL_ERROR"
       });
     }
 
-    // Store consumption record in MongoDB
-    // TEMPORARY: Allows multiple records for the same orderId
-    // PRODUCTION: Should only allow one record per orderId (enforced by unique index)
+    // DEFENSIVE LAYER 8: Store consumed order record (TEMP SAFE MODE)
     try {
       await ConsumedOrder.create({
         clientId,
         orderId: verifiedOrderId,
-        email: emailLower,
+        email: email,
         discordUserId,
         consumedAt: new Date()
       });
 
-      // Return success with orderId
-      res.json({
+      // Return success with real Shopify order ID
+      return res.json({
         ok: true,
         orderId: verifiedOrderId
       });
@@ -787,16 +750,16 @@ app.post("/shopify/consume-order", async (req, res) => {
       console.error("❌ Database error saving consumed order:", saveError);
       return res.status(500).json({
         ok: false,
-        reason: "DB_ERROR",
-        message: "Failed to save consumed order record"
+        reason: "INTERNAL_ERROR"
       });
     }
+
   } catch (error) {
-    console.error("❌ Error processing order:", error);
+    // FINAL CRASH-PROOF LAYER: Catch any unhandled errors
+    console.error("❌ Unhandled error in consume-order:", error);
     return res.status(500).json({
       ok: false,
-      reason: "PROCESSING_ERROR",
-      message: "Failed to process order verification"
+      reason: "INTERNAL_ERROR"
     });
   }
 });
