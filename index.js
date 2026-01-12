@@ -112,16 +112,17 @@ const Client = require("./models/Client");
  * - Consistent client resolution
  * - Proper error handling
  * - Multi-client isolation
+ * - clientId is treated as PRIMARY KEY
  * 
- * @param {string} clientId - Client identifier (required)
- * @returns {Promise<Object|null>} - Client document with shopify credentials, or null if not found
+ * @param {string} clientId - Client identifier (required, PRIMARY KEY)
+ * @returns {Promise<Object|null>} - Client document with shop and shopifyAccessToken, or null if not found
  * 
  * Usage in endpoints:
  *   const client = await getClientByClientId(clientId);
- *   if (!client || !client.shopify || !client.shopify.accessToken) {
- *     return res.status(404).json({ ok: false, reason: "STORE_NOT_FOUND" });
+ *   if (!client || !client.shop || !client.shopifyAccessToken) {
+ *     return res.status(404).json({ ok: false, reason: "CLIENT_NOT_FOUND" });
  *   }
- *   // Use client.shopify.shop and client.shopify.accessToken for API calls
+ *   // Use client.shop and client.shopifyAccessToken for API calls
  */
 async function getClientByClientId(clientId) {
   if (!clientId || typeof clientId !== "string" || clientId.trim().length === 0) {
@@ -129,7 +130,16 @@ async function getClientByClientId(clientId) {
   }
 
   try {
-    const client = await Client.findOne({ clientId: clientId.trim() });
+    const normalizedClientId = clientId.trim();
+    const client = await Client.findOne({ clientId: normalizedClientId });
+    
+    // Log claim lookup for debugging
+    if (client) {
+      console.log(`[CLAIM] Client found: clientId=${normalizedClientId}, shop=${client.shop || "N/A"}`);
+    } else {
+      console.log(`[CLAIM] Client NOT found: clientId=${normalizedClientId}`);
+    }
+    
     return client;
   } catch (error) {
     console.error(`❌ Error retrieving client (clientId=${clientId}):`, error);
@@ -552,33 +562,28 @@ app.get("/shopify/callback", async (req, res) => {
             }
 
             // Auto-create or update Client document in MongoDB
+            // IMPORTANT: clientId is PRIMARY KEY - NEVER generate or overwrite it
             try {
-              // Check if client exists
+              // Check if client exists (lookup by PRIMARY KEY: clientId)
               let client = await Client.findOne({ clientId });
 
               if (!client) {
                 // Auto-create new client document
+                // NEVER generate clientId - use the one from OAuth state
                 client = await Client.create({
-                  clientId,
-                  shopify: {
-                    shop,
-                    accessToken: access_token,
-                    scopes: scope || process.env.SHOPIFY_SCOPES || "",
-                    installedAt: new Date()
-                  },
+                  clientId, // PRIMARY KEY - from OAuth state, never generated
+                  shop,
+                  shopifyAccessToken: access_token,
                   createdAt: new Date()
                 });
-                console.log(`✅ Client created: clientId=${clientId}`);
+                console.log(`[OAUTH] Client created: clientId=${clientId}, shop=${shop}`);
               } else {
                 // Update existing client's Shopify connection
-                client.shopify = {
-                  shop,
-                  accessToken: access_token,
-                  scopes: scope || process.env.SHOPIFY_SCOPES || "",
-                  installedAt: new Date()
-                };
+                // NEVER overwrite clientId - it's the PRIMARY KEY
+                client.shop = shop;
+                client.shopifyAccessToken = access_token;
                 await client.save();
-                console.log(`✅ Client updated: clientId=${clientId}`);
+                console.log(`[OAUTH] Client updated: clientId=${clientId}, shop=${shop}`);
               }
 
               console.log(`✅ OAuth success: clientId=${clientId}, shop=${shop}`);
@@ -668,14 +673,15 @@ app.get("/shopify/verify-order", async (req, res) => {
   }
 
   // Load client and Shopify credentials from MongoDB (multi-client architecture)
+  // clientId is PRIMARY KEY - lookup is strict and isolated per client
   let client;
   try {
     client = await getClientByClientId(clientId);
-    if (!client || !client.shopify || !client.shopify.accessToken) {
+    if (!client || !client.shop || !client.shopifyAccessToken) {
       return res.status(404).json({
         ok: false,
-        reason: "STORE_NOT_FOUND",
-        message: "No Shopify store connected for this client"
+        reason: "CLIENT_NOT_FOUND",
+        message: "No Shopify store connected for this clientId"
       });
     }
   } catch (dbError) {
@@ -688,8 +694,8 @@ app.get("/shopify/verify-order", async (req, res) => {
   }
 
   // Extract Shopify credentials from client document (multi-client isolation)
-  const shop = client.shopify.shop;
-  const accessToken = client.shopify.accessToken;
+  const shop = client.shop;
+  const accessToken = client.shopifyAccessToken;
 
   // Prepare Shopify API request
   // Use Shopify Admin REST API to fetch orders
@@ -893,12 +899,14 @@ app.post("/shopify/consume-order", async (req, res) => {
     console.log("[DEBUG] Input type detected:", inputType);
 
     // Load client and Shopify credentials from MongoDB (multi-client architecture)
+    // clientId is PRIMARY KEY - lookup is strict and isolated per client
     // Multi-tenant safe: Use EXACT clientId from request, no fallbacks
     let client;
     try {
       client = await getClientByClientId(clientId);
       // Return explicit CLIENT_NOT_FOUND error if client doesn't exist
-      if (!client || !client.shopify || !client.shopify.accessToken) {
+      if (!client || !client.shop || !client.shopifyAccessToken) {
+        console.log(`[CLAIM] Client NOT found or not connected: clientId=${clientId}`);
         return res.status(404).json({
           ok: false,
           reason: "CLIENT_NOT_FOUND",
@@ -907,7 +915,7 @@ app.post("/shopify/consume-order", async (req, res) => {
       }
       
       // TEMP DEBUG: Log shop domain used
-      console.log("[DEBUG] Shop domain used:", client.shopify.shop);
+      console.log("[DEBUG] Shop domain used:", client.shop);
     } catch (dbError) {
       console.error(`❌ Database error loading client (clientId=${clientId}):`, dbError);
       return res.status(500).json({
@@ -917,8 +925,8 @@ app.post("/shopify/consume-order", async (req, res) => {
     }
 
     // Extract Shopify credentials from client document (multi-client isolation)
-    const shop = client.shopify.shop;
-    const accessToken = client.shopify.accessToken;
+    const shop = client.shop;
+    const accessToken = client.shopifyAccessToken;
 
     // Helper function to fetch order by Shopify ID
     const fetchOrderById = (orderId) => {
