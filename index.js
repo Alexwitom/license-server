@@ -264,78 +264,51 @@ app.post("/admin/generate", async (req, res) => {
  * 8. Returns success with updated expiresAt and formatted expiresAtHuman
  */
 app.post("/admin/expand", async (req, res) => {
-  const { license, days, adminKey } = req.body;
-
-  // Validate adminKey
-  if (adminKey !== process.env.ADMIN_KEY) {
-    return res.status(403).json({ ok: false, reason: "FORBIDDEN" });
-  }
-
-  // Validate required fields
-  if (!license || days === undefined) {
-    return res.status(400).json({ ok: false, reason: "BAD_REQUEST" });
-  }
-
-  // Validate days is a positive number
-  const daysNumber = Number(days);
-  if (!Number.isFinite(daysNumber) || daysNumber <= 0) {
-    return res.status(400).json({
-      ok: false,
-      reason: "INVALID_DAYS",
-      message: "days must be a positive number"
-    });
-  }
-
   try {
-    // Find license by key
+    const { license, days, adminKey } = req.body;
+
+    if (adminKey !== process.env.ADMIN_KEY) {
+      return res.status(403).json({ ok: false, reason: "FORBIDDEN" });
+    }
+
+    if (!license || typeof days !== "number" || days <= 0) {
+      return res.status(400).json({ ok: false, reason: "INVALID_INPUT" });
+    }
+
     const lic = await License.findOne({ key: license });
-    
     if (!lic) {
-      return res.status(404).json({
-        ok: false,
-        reason: "NOT_FOUND",
-        message: "License not found"
-      });
+      return res.status(404).json({ ok: false, reason: "NOT_FOUND" });
     }
 
-    // Determine base date: use expiresAt if valid, otherwise use current date
-    let baseDate;
-    
-    if (lic.expiresAt) {
-      // Try to create Date from expiresAt (handles both Date objects and strings)
-      const parsedDate = new Date(lic.expiresAt);
-      
-      // Check if parsed date is valid
-      if (parsedDate instanceof Date && !isNaN(parsedDate.getTime())) {
-        baseDate = parsedDate;
-      } else {
-        // Invalid date, use current date
-        baseDate = new Date();
+    let baseDate = new Date();
+
+    if (
+      lic.expiresAt &&
+      (lic.expiresAt instanceof Date || typeof lic.expiresAt === "string")
+    ) {
+      const parsed = new Date(lic.expiresAt);
+      if (!isNaN(parsed.getTime())) {
+        baseDate = parsed;
       }
-    } else {
-      // expiresAt is null or undefined, use current date
-      baseDate = new Date();
     }
 
-    // Add days to base date
-    const newExpiresAt = new Date(baseDate.getTime() + daysNumber * 86400000);
+    baseDate.setDate(baseDate.getDate() + days);
 
-    // Update license - ensure expiresAt is saved as Date object
-    lic.expiresAt = newExpiresAt;
+    // FORCE valid Date into Mongo
+    lic.expiresAt = new Date(baseDate.getTime());
     await lic.save();
 
-    // Return success with updated expiration dates
-    res.json({
+    return res.json({
       ok: true,
-      expiresAt: newExpiresAt.toISOString(),
-      expiresAtHuman: newExpiresAt.toLocaleString("pl-PL")
+      expiresAt: lic.expiresAt.toISOString(),
+      expiresAtHuman: lic.expiresAt.toLocaleString("pl-PL")
     });
-  } catch (error) {
-    console.error("❌ Error expanding license:", error);
+  } catch (err) {
+    console.error("EXPAND ERROR:", err);
     return res.status(500).json({
       ok: false,
       reason: "DB_ERROR",
-      message: error.message || "Failed to update license"
+      message: err.message
     });
   }
 });
