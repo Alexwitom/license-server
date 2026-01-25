@@ -237,6 +237,91 @@ app.post("/admin/generate", async (req, res) => {
   });
 });
 
+/* ================= EXPAND ================= */
+
+/**
+ * POST /admin/expand
+ * Extends the expiration date of an existing license by adding days
+ * 
+ * Request body:
+ *   - license: License key (required)
+ *   - days: Number of days to add (required, must be positive number)
+ *   - adminKey: Admin authentication key (required)
+ * 
+ * Usage:
+ *   - Admin extends a license expiration date
+ *   - Days are added to the current expiresAt date
+ *   - If license doesn't exist, returns 404
+ * 
+ * Flow:
+ * 1. Validates adminKey against process.env.ADMIN_KEY
+ * 2. Validates required fields (license, days, adminKey)
+ * 3. Validates days is a positive number
+ * 4. Finds license in MongoDB by key
+ * 5. If not found → returns 404
+ * 6. Adds days to expiresAt date
+ * 7. Saves updated license
+ * 8. Returns success with updated expiresAt and formatted expiresAtHuman
+ */
+app.post("/admin/expand", async (req, res) => {
+  const { license, days, adminKey } = req.body;
+
+  // Validate adminKey
+  if (adminKey !== process.env.ADMIN_KEY) {
+    return res.status(403).json({ ok: false, reason: "FORBIDDEN" });
+  }
+
+  // Validate required fields
+  if (!license || days === undefined) {
+    return res.status(400).json({ ok: false, reason: "BAD_REQUEST" });
+  }
+
+  // Validate days is a positive number
+  const daysNumber = Number(days);
+  if (!Number.isFinite(daysNumber) || daysNumber <= 0) {
+    return res.status(400).json({
+      ok: false,
+      reason: "INVALID_DAYS",
+      message: "days must be a positive number"
+    });
+  }
+
+  try {
+    // Find license by key
+    const lic = await License.findOne({ key: license });
+    
+    if (!lic) {
+      return res.status(404).json({
+        ok: false,
+        reason: "NOT_FOUND",
+        message: "License not found"
+      });
+    }
+
+    // Add days to expiresAt
+    const currentExpiresAt = new Date(lic.expiresAt);
+    const newExpiresAt = new Date(currentExpiresAt.getTime() + daysNumber * 86400000);
+
+    // Update license
+    lic.expiresAt = newExpiresAt;
+    await lic.save();
+
+    // Return success with updated expiration dates
+    res.json({
+      ok: true,
+      expiresAt: newExpiresAt.toISOString(),
+      expiresAtHuman: newExpiresAt.toLocaleString("pl-PL")
+    });
+  } catch (error) {
+    console.error("❌ Error expanding license:", error);
+    return res.status(500).json({
+      ok: false,
+      reason: "DB_ERROR",
+      message: "Failed to update license"
+    });
+  }
+});
+
 /* ================= SHOPIFY OAUTH ================= */
 
 /**
