@@ -273,11 +273,20 @@ app.post("/admin/expand", async (req, res) => {
     }
 
     // Validate required fields
-    if (!licenseKey || typeof days !== "number" || days <= 0 || !Number.isInteger(days)) {
+    if (!licenseKey) {
       return res.status(400).json({ 
         ok: false, 
         reason: "INVALID_INPUT",
-        message: "licenseKey and days (positive integer) are required"
+        message: "licenseKey is required"
+      });
+    }
+
+    // Validate days is a number
+    if (typeof days !== "number" || days <= 0 || !Number.isFinite(days)) {
+      return res.status(400).json({ 
+        ok: false, 
+        reason: "INVALID_INPUT",
+        message: "days must be a positive number"
       });
     }
 
@@ -288,13 +297,7 @@ app.post("/admin/expand", async (req, res) => {
       return res.status(404).json({ ok: false, reason: "NOT_FOUND" });
     }
 
-    // Check if revoked
-    if (license.revoked === true) {
-      console.log(`[EXPAND] License is revoked: ${licenseKey}`);
-      return res.status(400).json({ ok: false, reason: "REVOKED" });
-    }
-
-    // Validate expiresAt exists and is valid
+    // Validate expiresAt exists
     if (!license.expiresAt) {
       console.error(`[EXPAND] License expiresAt is missing: ${licenseKey}`);
       return res.status(400).json({
@@ -305,10 +308,10 @@ app.post("/admin/expand", async (req, res) => {
     }
 
     // Parse expiresAt as Date object
-    const currentExpires = new Date(license.expiresAt);
+    const oldExpiresAt = new Date(license.expiresAt);
 
     // Validate that expiresAt is a valid date
-    if (isNaN(currentExpires.getTime())) {
+    if (isNaN(oldExpiresAt.getTime())) {
       console.error(`[EXPAND] License expiresAt is invalid: ${licenseKey}, expiresAt: ${license.expiresAt}`);
       return res.status(400).json({
         ok: false,
@@ -317,12 +320,9 @@ app.post("/admin/expand", async (req, res) => {
       });
     }
 
-    // Store old expiresAt for response
-    const oldExpiresAt = new Date(currentExpires);
-
-    // Add days to CURRENT expiresAt (NOT now, NOT createdAt)
-    const newExpiresAt = new Date(currentExpires);
-    newExpiresAt.setUTCDate(newExpiresAt.getUTCDate() + days);
+    // Calculate newExpiresAt using Date arithmetic (Date + milliseconds)
+    // days * 24 hours * 60 minutes * 60 seconds * 1000 milliseconds
+    const newExpiresAt = new Date(oldExpiresAt.getTime() + days * 24 * 60 * 60 * 1000);
 
     // Save updated expiresAt to MongoDB
     license.expiresAt = newExpiresAt;
@@ -333,10 +333,9 @@ app.post("/admin/expand", async (req, res) => {
     // Return success with updated expiration dates
     return res.json({
       ok: true,
-      key: licenseKey,
+      licenseKey: licenseKey,
       oldExpiresAt: oldExpiresAt.toISOString(),
-      newExpiresAt: newExpiresAt.toISOString(),
-      newExpiresAtHuman: newExpiresAt.toLocaleString("pl-PL")
+      newExpiresAt: newExpiresAt.toISOString()
     });
   } catch (err) {
     console.error("[EXPAND ERROR]:", err);
@@ -384,7 +383,7 @@ app.post("/admin/revoke", async (req, res) => {
     // Return success
     return res.json({ 
       ok: true, 
-      key: licenseKey,
+      licenseKey: licenseKey,
       revoked: true
     });
   } catch (err) {
