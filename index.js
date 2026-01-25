@@ -298,11 +298,29 @@ app.post("/admin/expand", async (req, res) => {
       });
     }
 
-    // Add days to expiresAt
-    const currentExpiresAt = new Date(lic.expiresAt);
-    const newExpiresAt = new Date(currentExpiresAt.getTime() + daysNumber * 86400000);
+    // Determine base date: use expiresAt if valid, otherwise use current date
+    let baseDate;
+    
+    if (lic.expiresAt) {
+      // Try to create Date from expiresAt (handles both Date objects and strings)
+      const parsedDate = new Date(lic.expiresAt);
+      
+      // Check if parsed date is valid
+      if (parsedDate instanceof Date && !isNaN(parsedDate.getTime())) {
+        baseDate = parsedDate;
+      } else {
+        // Invalid date, use current date
+        baseDate = new Date();
+      }
+    } else {
+      // expiresAt is null or undefined, use current date
+      baseDate = new Date();
+    }
 
-    // Update license
+    // Add days to base date
+    const newExpiresAt = new Date(baseDate.getTime() + daysNumber * 86400000);
+
+    // Update license - ensure expiresAt is saved as Date object
     lic.expiresAt = newExpiresAt;
     await lic.save();
 
@@ -317,7 +335,7 @@ app.post("/admin/expand", async (req, res) => {
     return res.status(500).json({
       ok: false,
       reason: "DB_ERROR",
-      message: "Failed to update license"
+      message: error.message || "Failed to update license"
     });
   }
 });
