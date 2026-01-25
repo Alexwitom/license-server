@@ -493,24 +493,25 @@ app.post("/admin/revoke", async (req, res) => {
       });
     }
 
-    // Find license by key
-    const license = await License.findOne({ key: licenseKey });
-    if (!license) {
+    // Delete the license document from MongoDB
+    const result = await License.deleteOne({ key: licenseKey });
+    
+    // Log delete result
+    console.log(`[REVOKE] deleteOne result: deletedCount=${result.deletedCount}`);
+
+    // Check if document was deleted
+    if (result.deletedCount === 0) {
       console.log(`[REVOKE] License not found: ${licenseKey}`);
       return res.status(404).json({ ok: false, reason: "NOT_FOUND" });
     }
 
-    // Set revoked = true
-    license.revoked = true;
-    await license.save();
-
-    console.log(`[REVOKE] License revoked: ${licenseKey}`);
+    // Document was successfully deleted
+    console.log(`[REVOKE] License deleted: ${licenseKey}`);
 
     // Return success
     return res.json({ 
       ok: true, 
-      licenseKey: licenseKey,
-      revoked: true
+      licenseKey: licenseKey
     });
   } catch (err) {
     console.error("[REVOKE ERROR]:", err);
