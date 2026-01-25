@@ -265,40 +265,51 @@ app.post("/admin/generate", async (req, res) => {
  */
 app.post("/admin/expand", async (req, res) => {
   try {
-    const { license, days, adminKey } = req.body;
+    const { licenseKey, days, adminKey } = req.body;
 
+    // Validate adminKey
     if (adminKey !== process.env.ADMIN_KEY) {
       return res.status(403).json({ ok: false, reason: "FORBIDDEN" });
     }
 
-    // Validate days is a positive integer
-    if (!license || typeof days !== "number" || days <= 0 || !Number.isInteger(days)) {
+    // Validate required fields
+    if (!licenseKey || typeof days !== "number" || days <= 0 || !Number.isInteger(days)) {
       return res.status(400).json({ 
         ok: false, 
         reason: "INVALID_INPUT",
-        message: "days must be a positive integer"
+        message: "licenseKey and days (positive integer) are required"
       });
     }
 
-    const lic = await License.findOne({ key: license });
-    if (!lic) {
+    // Find license by key
+    const license = await License.findOne({ key: licenseKey });
+    if (!license) {
+      console.log(`[EXPAND] License not found: ${licenseKey}`);
       return res.status(404).json({ ok: false, reason: "NOT_FOUND" });
     }
 
-    // Parse expiresAt as Date object
-    if (!lic.expiresAt) {
+    // Check if revoked
+    if (license.revoked === true) {
+      console.log(`[EXPAND] License is revoked: ${licenseKey}`);
+      return res.status(400).json({ ok: false, reason: "REVOKED" });
+    }
+
+    // Validate expiresAt exists and is valid
+    if (!license.expiresAt) {
+      console.error(`[EXPAND] License expiresAt is missing: ${licenseKey}`);
       return res.status(400).json({
         ok: false,
         reason: "INVALID_EXPIRES_AT",
-        message: "License expiresAt is missing or invalid"
+        message: "License expiresAt is missing"
       });
     }
 
-    const now = new Date();
-    const currentExpires = new Date(lic.expiresAt);
+    // Parse expiresAt as Date object
+    const currentExpires = new Date(license.expiresAt);
 
     // Validate that expiresAt is a valid date
     if (isNaN(currentExpires.getTime())) {
+      console.error(`[EXPAND] License expiresAt is invalid: ${licenseKey}, expiresAt: ${license.expiresAt}`);
       return res.status(400).json({
         ok: false,
         reason: "INVALID_EXPIRES_AT",
@@ -306,24 +317,29 @@ app.post("/admin/expand", async (req, res) => {
       });
     }
 
-    // Determine base date: use future expiresAt, otherwise use now
-    const baseDate = currentExpires > now ? new Date(currentExpires) : new Date(now);
-    
-    // Add days using UTC to avoid timezone issues
-    baseDate.setUTCDate(baseDate.getUTCDate() + days);
+    // Store old expiresAt for response
+    const oldExpiresAt = new Date(currentExpires);
 
-    // Save updated expiresAt
-    lic.expiresAt = baseDate.toISOString();
-    await lic.save();
+    // Add days to CURRENT expiresAt (NOT now, NOT createdAt)
+    const newExpiresAt = new Date(currentExpires);
+    newExpiresAt.setUTCDate(newExpiresAt.getUTCDate() + days);
 
-    // Return updated expiration dates
+    // Save updated expiresAt to MongoDB
+    license.expiresAt = newExpiresAt;
+    await license.save();
+
+    console.log(`[EXPAND] License expanded: ${licenseKey}, old: ${oldExpiresAt.toISOString()}, new: ${newExpiresAt.toISOString()}, days: ${days}`);
+
+    // Return success with updated expiration dates
     return res.json({
       ok: true,
-      expiresAt: lic.expiresAt,
-      expiresAtHuman: new Date(lic.expiresAt).toLocaleString("pl-PL")
+      key: licenseKey,
+      oldExpiresAt: oldExpiresAt.toISOString(),
+      newExpiresAt: newExpiresAt.toISOString(),
+      newExpiresAtHuman: newExpiresAt.toLocaleString("pl-PL")
     });
   } catch (err) {
-    console.error("EXPAND ERROR:", err);
+    console.error("[EXPAND ERROR]:", err);
     return res.status(500).json({
       ok: false,
       reason: "DB_ERROR",
@@ -336,24 +352,48 @@ app.post("/admin/expand", async (req, res) => {
 
 app.post("/admin/revoke", async (req, res) => {
   try {
-    const { key, adminKey } = req.body;
+    const { licenseKey, adminKey } = req.body;
 
+    // Validate adminKey
     if (adminKey !== process.env.ADMIN_KEY) {
       return res.status(403).json({ ok: false, reason: "FORBIDDEN" });
     }
 
-    const license = await License.findOne({ key });
+    // Validate required fields
+    if (!licenseKey) {
+      return res.status(400).json({ 
+        ok: false, 
+        reason: "INVALID_INPUT",
+        message: "licenseKey is required"
+      });
+    }
+
+    // Find license by key
+    const license = await License.findOne({ key: licenseKey });
     if (!license) {
+      console.log(`[REVOKE] License not found: ${licenseKey}`);
       return res.status(404).json({ ok: false, reason: "NOT_FOUND" });
     }
 
+    // Set revoked = true
     license.revoked = true;
     await license.save();
 
-    res.json({ ok: true });
+    console.log(`[REVOKE] License revoked: ${licenseKey}`);
+
+    // Return success
+    return res.json({ 
+      ok: true, 
+      key: licenseKey,
+      revoked: true
+    });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ ok: false, reason: "DB_ERROR" });
+    console.error("[REVOKE ERROR]:", err);
+    return res.status(500).json({ 
+      ok: false, 
+      reason: "DB_ERROR",
+      message: err.message
+    });
   }
 });
 
