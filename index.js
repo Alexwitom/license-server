@@ -364,22 +364,64 @@ app.post("/admin/expand", async (req, res) => {
     // days * 24 hours * 60 minutes * 60 seconds * 1000 milliseconds
     const newExpiresAt = new Date(oldExpiresAt.getTime() + days * 24 * 60 * 60 * 1000);
 
+    // Log BEFORE save
+    console.log(`[EXPAND] BEFORE save - License ID: ${license._id}`);
+    console.log(`[EXPAND] BEFORE save - expiresAt: ${license.expiresAt}`);
+    if (license.bots && typeof license.bots === 'object') {
+      const botIds = Object.keys(license.bots);
+      for (const botId of botIds) {
+        console.log(`[EXPAND] BEFORE save - bots[${botId}].expiresAt: ${license.bots[botId]?.expiresAt}`);
+      }
+    }
+
     // Save updated expiresAt to MongoDB at root level
     license.expiresAt = newExpiresAt;
     
     // Also update in bots structure if it exists (for backward compatibility)
+    let botsModified = false;
     if (license.bots && typeof license.bots === 'object') {
       const botIds = Object.keys(license.bots);
       for (const botId of botIds) {
         if (license.bots[botId] && license.bots[botId].expiresAt) {
           license.bots[botId].expiresAt = newExpiresAt;
+          botsModified = true;
         }
+      }
+      
+      // CRITICAL: Mark bots as modified so Mongoose detects the change
+      if (botsModified) {
+        license.markModified("bots");
+        console.log(`[EXPAND] Marked 'bots' as modified`);
       }
     }
     
+    // Save the document
     await license.save();
 
-    console.log(`[EXPAND] License expanded: ${licenseKey}, old: ${oldExpiresAt.toISOString()}, new: ${newExpiresAt.toISOString()}, days: ${days}`);
+    // Log AFTER save
+    console.log(`[EXPAND] AFTER save - License ID: ${license._id}`);
+    console.log(`[EXPAND] AFTER save - expiresAt: ${license.expiresAt}`);
+    if (license.bots && typeof license.bots === 'object') {
+      const botIds = Object.keys(license.bots);
+      for (const botId of botIds) {
+        console.log(`[EXPAND] AFTER save - bots[${botId}].expiresAt: ${license.bots[botId]?.expiresAt}`);
+      }
+    }
+
+    // Verify the saved document by reloading from MongoDB
+    const savedLicense = await License.findOne({ key: licenseKey });
+    if (savedLicense) {
+      console.log(`[EXPAND] VERIFICATION - Reloaded License ID: ${savedLicense._id}`);
+      console.log(`[EXPAND] VERIFICATION - Reloaded expiresAt: ${savedLicense.expiresAt}`);
+      if (savedLicense.bots && typeof savedLicense.bots === 'object') {
+        const botIds = Object.keys(savedLicense.bots);
+        for (const botId of botIds) {
+          console.log(`[EXPAND] VERIFICATION - Reloaded bots[${botId}].expiresAt: ${savedLicense.bots[botId]?.expiresAt}`);
+        }
+      }
+    }
+
+    console.log(`[EXPAND] License expanded: ${licenseKey}, old: ${oldExpiresAt.toISOString()}, new: ${newExpiresAt.toISOString()}, days: ${days}, document ID: ${license._id}`);
 
     // Return success with updated expiration dates
     return res.json({
@@ -421,22 +463,33 @@ app.post("/admin/revoke", async (req, res) => {
     console.log(`[REVOKE] Request body:`, JSON.stringify(body, null, 2));
     console.log(`[REVOKE] Body type:`, typeof body);
     console.log(`[REVOKE] licenseKey in body:`, body.licenseKey);
+    console.log(`[REVOKE] license in body:`, body.license);
     console.log(`[REVOKE] adminKey in body:`, body.adminKey ? "present" : "missing");
 
-    const { licenseKey, adminKey } = body;
+    const { adminKey } = body;
+
+    // Normalize licenseKey: accept both "licenseKey" and "license" for backward compatibility
+    const licenseKey = body.licenseKey || body.license;
+    
+    // Log which field was used
+    if (body.licenseKey) {
+      console.log(`[REVOKE] Using 'licenseKey' field: ${licenseKey}`);
+    } else if (body.license) {
+      console.log(`[REVOKE] Using 'license' field: ${licenseKey}`);
+    }
 
     // Validate adminKey
     if (adminKey !== process.env.ADMIN_KEY) {
       return res.status(403).json({ ok: false, reason: "FORBIDDEN" });
     }
 
-    // Validate required fields - check for licenseKey with better error message
+    // Validate required fields - check for licenseKey or license
     if (!licenseKey) {
-      console.error(`[REVOKE] licenseKey is missing. Body keys:`, Object.keys(body || {}));
+      console.error(`[REVOKE] Neither licenseKey nor license is present. Body keys:`, Object.keys(body || {}));
       return res.status(400).json({ 
         ok: false, 
         reason: "INVALID_INPUT",
-        message: "licenseKey is required in request body"
+        message: "licenseKey or license is required in request body"
       });
     }
 
