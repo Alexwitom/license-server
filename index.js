@@ -224,6 +224,7 @@ app.post("/admin/generate", async (req, res) => {
     key,
     active: true,
     hwid: null,
+    expiresAt: expiresAt, // Store at root level for expand/revoke endpoints
     bots: {
       [botId]: { expiresAt }
     }
@@ -265,7 +266,22 @@ app.post("/admin/generate", async (req, res) => {
  */
 app.post("/admin/expand", async (req, res) => {
   try {
-    const { licenseKey, days, adminKey } = req.body;
+    // Handle body parsing if it's a string (from express.text middleware)
+    let body = req.body;
+    if (typeof body === 'string') {
+      try {
+        body = JSON.parse(body);
+      } catch (parseError) {
+        console.error("[EXPAND] Failed to parse body as JSON:", parseError);
+        return res.status(400).json({
+          ok: false,
+          reason: "INVALID_INPUT",
+          message: "Invalid JSON in request body"
+        });
+      }
+    }
+
+    const { licenseKey, days, adminKey } = body;
 
     // Validate adminKey
     if (adminKey !== process.env.ADMIN_KEY) {
@@ -274,10 +290,11 @@ app.post("/admin/expand", async (req, res) => {
 
     // Validate required fields
     if (!licenseKey) {
+      console.error(`[EXPAND] licenseKey is missing. Body keys:`, Object.keys(body || {}));
       return res.status(400).json({ 
         ok: false, 
         reason: "INVALID_INPUT",
-        message: "licenseKey is required"
+        message: "licenseKey is required in request body"
       });
     }
 
@@ -297,9 +314,32 @@ app.post("/admin/expand", async (req, res) => {
       return res.status(404).json({ ok: false, reason: "NOT_FOUND" });
     }
 
+    // Log license object structure for debugging
+    console.log(`[EXPAND] License found: ${licenseKey}, structure:`, JSON.stringify({
+      hasExpiresAt: !!license.expiresAt,
+      expiresAt: license.expiresAt,
+      hasBots: !!license.bots,
+      botsKeys: license.bots ? Object.keys(license.bots) : []
+    }, null, 2));
+
+    // Try to find expiresAt: check root level first, then bots structure
+    let expiresAtValue = license.expiresAt;
+    
+    // If not at root level, try to find in bots (backward compatibility)
+    if (!expiresAtValue && license.bots && typeof license.bots === 'object') {
+      const botIds = Object.keys(license.bots);
+      if (botIds.length > 0) {
+        // Use the first bot's expiresAt if root level doesn't exist
+        const firstBotId = botIds[0];
+        expiresAtValue = license.bots[firstBotId]?.expiresAt;
+        console.log(`[EXPAND] Found expiresAt in bots[${firstBotId}]:`, expiresAtValue);
+      }
+    }
+
     // Validate expiresAt exists
-    if (!license.expiresAt) {
+    if (!expiresAtValue) {
       console.error(`[EXPAND] License expiresAt is missing: ${licenseKey}`);
+      console.error(`[EXPAND] Full license object:`, JSON.stringify(license.toObject(), null, 2));
       return res.status(400).json({
         ok: false,
         reason: "INVALID_EXPIRES_AT",
@@ -308,7 +348,7 @@ app.post("/admin/expand", async (req, res) => {
     }
 
     // Parse expiresAt as Date object
-    const oldExpiresAt = new Date(license.expiresAt);
+    const oldExpiresAt = new Date(expiresAtValue);
 
     // Validate that expiresAt is a valid date
     if (isNaN(oldExpiresAt.getTime())) {
@@ -324,8 +364,19 @@ app.post("/admin/expand", async (req, res) => {
     // days * 24 hours * 60 minutes * 60 seconds * 1000 milliseconds
     const newExpiresAt = new Date(oldExpiresAt.getTime() + days * 24 * 60 * 60 * 1000);
 
-    // Save updated expiresAt to MongoDB
+    // Save updated expiresAt to MongoDB at root level
     license.expiresAt = newExpiresAt;
+    
+    // Also update in bots structure if it exists (for backward compatibility)
+    if (license.bots && typeof license.bots === 'object') {
+      const botIds = Object.keys(license.bots);
+      for (const botId of botIds) {
+        if (license.bots[botId] && license.bots[botId].expiresAt) {
+          license.bots[botId].expiresAt = newExpiresAt;
+        }
+      }
+    }
+    
     await license.save();
 
     console.log(`[EXPAND] License expanded: ${licenseKey}, old: ${oldExpiresAt.toISOString()}, new: ${newExpiresAt.toISOString()}, days: ${days}`);
@@ -351,19 +402,41 @@ app.post("/admin/expand", async (req, res) => {
 
 app.post("/admin/revoke", async (req, res) => {
   try {
-    const { licenseKey, adminKey } = req.body;
+    // Handle body parsing if it's a string (from express.text middleware)
+    let body = req.body;
+    if (typeof body === 'string') {
+      try {
+        body = JSON.parse(body);
+      } catch (parseError) {
+        console.error("[REVOKE] Failed to parse body as JSON:", parseError);
+        return res.status(400).json({
+          ok: false,
+          reason: "INVALID_INPUT",
+          message: "Invalid JSON in request body"
+        });
+      }
+    }
+
+    // Log request body for debugging
+    console.log(`[REVOKE] Request body:`, JSON.stringify(body, null, 2));
+    console.log(`[REVOKE] Body type:`, typeof body);
+    console.log(`[REVOKE] licenseKey in body:`, body.licenseKey);
+    console.log(`[REVOKE] adminKey in body:`, body.adminKey ? "present" : "missing");
+
+    const { licenseKey, adminKey } = body;
 
     // Validate adminKey
     if (adminKey !== process.env.ADMIN_KEY) {
       return res.status(403).json({ ok: false, reason: "FORBIDDEN" });
     }
 
-    // Validate required fields
+    // Validate required fields - check for licenseKey with better error message
     if (!licenseKey) {
+      console.error(`[REVOKE] licenseKey is missing. Body keys:`, Object.keys(body || {}));
       return res.status(400).json({ 
         ok: false, 
         reason: "INVALID_INPUT",
-        message: "licenseKey is required"
+        message: "licenseKey is required in request body"
       });
     }
 
